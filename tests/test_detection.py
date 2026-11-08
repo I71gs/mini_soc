@@ -41,11 +41,31 @@ def test_detection_engine_flags_failed_logon_spike():
     assert any(alert.rule_name == "failed_logon_spike" for alert in alerts)
 
 
+def test_detection_engine_ignores_benign_powershell_usage():
+    event = _make_event(
+        source="process_collector",
+        event_type="process_started",
+        attributes={
+            "name": "powershell.exe",
+            "pid": 4567,
+            "command_line": "powershell.exe -NoProfile -Command Get-ChildItem C:\\Temp",
+        },
+    )
+
+    alerts = DetectionEngine().evaluate([event])
+
+    assert not any(alert.rule_name == "suspicious_process" for alert in alerts)
+
+
 def test_incident_manager_creates_incidents_from_alerts():
     event = _make_event(
         source="process_collector",
         event_type="process_started",
-        attributes={"name": "cmd.exe", "pid": 9999},
+        attributes={
+            "name": "cmd.exe",
+            "pid": 9999,
+            "command_line": "cmd.exe /c powershell -enc ZgB1AGQAZQBzAHQAcwA==",
+        },
     )
     alerts = DetectionEngine().evaluate([event])
 

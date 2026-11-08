@@ -6,6 +6,7 @@ repeated failed logons, and high-risk outbound network connections.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,9 +19,6 @@ SUSPICIOUS_PROCESS_NAMES = {
     "regsvr32.exe",
     "wmic.exe",
     "mshta.exe",
-    "cmd.exe",
-    "powershell.exe",
-    "powershell_ise.exe",
     "certutil.exe",
     "bitsadmin.exe",
     "netsh.exe",
@@ -28,7 +26,68 @@ SUSPICIOUS_PROCESS_NAMES = {
     "psexec.exe",
 }
 
+SUSPICIOUS_CMD_PATTERNS = (
+    "/c powershell",
+    "/k powershell",
+    "powershell -enc",
+    "powershell -e",
+    "rundll32",
+    "regsvr32",
+    "certutil",
+    "bitsadmin",
+    "wmic",
+    "netsh",
+    "curl http",
+    "curl https",
+    "start /b",
+    "mshta",
+)
+
+SUSPICIOUS_POWERSHELL_PATTERNS = (
+    "-enc",
+    "encodedcommand",
+    "downloadstring",
+    "invoke-webrequest",
+    "invoke-expression",
+    "frombase64string",
+    "iex",
+    "bypass",
+    "noninteractive",
+    "-w hidden",
+    "http://",
+    "https://",
+    "rundll32",
+    "wmic",
+    "certutil",
+    "bitsadmin",
+    "regsvr32",
+)
+
 SUSPICIOUS_REMOTE_PORTS = {22, 23, 3389, 445, 4444, 4445, 4446, 8080, 8443}
+
+
+def _is_suspicious_cmd_command(command_line: str) -> bool:
+    """Treat cmd.exe as suspicious only when used for obvious offensive chaining."""
+    lowered = re.sub(r"\s+", " ", command_line.lower()).strip()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in SUSPICIOUS_CMD_PATTERNS)
+
+
+def _is_suspicious_powershell_command(command_line: str) -> bool:
+    """Reduce false positives by requiring suspicious PowerShell execution patterns."""
+    lowered = re.sub(r"\s+", " ", command_line.lower()).strip()
+    if not lowered:
+        return False
+
+    tokenized = set(re.findall(r"[a-z0-9./:-]+", lowered))
+    if any(token in tokenized for token in {"-enc", "encodedcommand", "downloadstring", "iex"}):
+        return True
+
+    if any(token in lowered for token in SUSPICIOUS_POWERSHELL_PATTERNS):
+        return True
+
+    return False
 
 
 @dataclass(frozen=True)
@@ -69,26 +128,43 @@ class SuspiciousProcessRule(DetectionRule):
         for event in events:
             if event.event_type != "process_started":
                 continue
+
             process_name = str(event.attributes.get("name", "")).lower()
-            if process_name in SUSPICIOUS_PROCESS_NAMES:
-                alerts.append(
-                    DetectionAlert(
-                        rule_name=self.name,
-                        title=f"Suspicious process observed: {process_name}",
-                        description=(
-                            f"Process '{process_name}' was started on host '{event.host}' and may be "
-                            "used for defense evasion or administrative abuse."
-                        ),
-                        severity=self.severity,
-                        source=event.source,
-                        related_event_ids=[str(event.event_id)],
-                        attributes={
-                            "pid": event.attributes.get("pid"),
-                            "exe": event.attributes.get("exe"),
-                            "username": event.attributes.get("username"),
-                        },
-                    )
+            command_line = str(
+                event.attributes.get("command_line")
+                or event.attributes.get("command")
+                or event.attributes.get("args")
+                or ""
+            ).lower()
+
+            if process_name in {"cmd.exe"}:
+                if not _is_suspicious_cmd_command(command_line):
+                    continue
+            elif process_name in {"powershell.exe", "powershell_ise.exe"}:
+                if not _is_suspicious_powershell_command(command_line):
+                    continue
+            elif process_name not in SUSPICIOUS_PROCESS_NAMES:
+                continue
+
+            alerts.append(
+                DetectionAlert(
+                    rule_name=self.name,
+                    title=f"Suspicious process observed: {process_name}",
+                    description=(
+                        f"Process '{process_name}' was started on host '{event.host}' and may be "
+                        "used for defense evasion or administrative abuse."
+                    ),
+                    severity=self.severity,
+                    source=event.source,
+                    related_event_ids=[str(event.event_id)],
+                    attributes={
+                        "pid": event.attributes.get("pid"),
+                        "exe": event.attributes.get("exe"),
+                        "username": event.attributes.get("username"),
+                        "command_line": event.attributes.get("command_line") or event.attributes.get("command"),
+                    },
                 )
+            )
         return alerts
 
 

@@ -311,6 +311,7 @@ class WindowsEventCollector:
 
         self._in_memory_checkpoints: dict[str, int] = {}
         self._processed_keys: set[tuple[str, int]] = set()
+        self._permission_warned_channels: set[str] = set()
 
     def get_checkpoint(self, channel: str) -> int | None:
         """Get the last processed EventRecordID for a channel."""
@@ -414,12 +415,16 @@ class WindowsEventCollector:
         try:
             query_handle = win32evtlog.EvtQuery(channel, flags, xpath)
         except Exception as err:
-            # Handle Access Denied (error code 5) or missing channel gracefully
-            logger.warning(
-                "Unable to query Windows Event Log channel '%s' (Access/Channel limitation): %s",
-                channel,
-                err,
-            )
+            # Handle Access Denied (error code 5) or missing channel gracefully.
+            # This environment can legitimately deny Security log access, so warn once per channel
+            # instead of spamming the log on every collection cycle.
+            if channel not in self._permission_warned_channels:
+                logger.warning(
+                    "Unable to query Windows Event Log channel '%s' (Access/Channel limitation): %s",
+                    channel,
+                    err,
+                )
+                self._permission_warned_channels.add(channel)
             return []
 
         raw_events = []
