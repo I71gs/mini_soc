@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# Environments
+.venv/
+env/
+venv/
+
+# Mini SOC local data and logs (keep directory via .gitkeep)
+data/*
+!data/.gitkeep
