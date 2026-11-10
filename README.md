@@ -108,21 +108,42 @@ mini-soc/
 ## 4. Getting Started
 
 ### Prerequisites
-- **Python** 3.12+ (tested on Python 3.14, Windows 11)
-- **Git** (optional)
+- **Windows 10/11**
+- **Python 3.12 or newer** (tested on Windows 11 with Python 3.14)
+- **Git** to clone the repository
 
-### Virtual Environment (Recommended)
-
+### Quick setup (Windows PowerShell)
 ```powershell
+git clone https://github.com/I71gs/mini_soc.git
+cd mini_soc
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### Install Dependencies
+You do not need to activate the virtual environment when using the commands below; they call its Python executable directly. If you prefer to activate it in PowerShell, run:
 
 ```powershell
-pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
 ```
+
+If PowerShell blocks activation, continue using `.venv\Scripts\python.exe` as shown above.
+
+### Try the desktop app
+
+```powershell
+.venv\Scripts\python.exe main.py --gui
+```
+
+### Run the headless collection check
+
+```powershell
+.venv\Scripts\python.exe main.py
+```
+
+The first run initializes a local SQLite database at `data\minisoc.db` and creates local logs under `data\logs`. The app does not send telemetry to a cloud service. The headless run collects available host telemetry and attempts to read configured Windows Event Log channels.
+
+> **Windows permissions:** Windows may deny access to the Security Event Log when the app is run as a standard user. The app should still start; Security log collection will be unavailable in that session. Run with the required Windows permissions only if you need to test that source, and only on a machine you are authorized to monitor.
 
 #### Dependencies
 | Package | Purpose |
@@ -137,24 +158,26 @@ pip install -r requirements.txt
 
 ## 5. Running the Application
 
-### Headless Mode (Default)
-Collect telemetry, run detection rules, and print a summary to the console:
+The quick-start commands above use the project virtual environment. If you activated it, you can use `python` instead of `.venv\Scripts\python.exe`.
+
+### Headless Mode
+Collect available telemetry, run detection rules, and print a summary to the console:
 
 ```powershell
-python main.py
+.venv\Scripts\python.exe main.py
 ```
 
 ### Desktop GUI Mode
-Launch the PySide6 security console with sidebar navigation, live metrics, and analyst tools:
+Launch the PySide6 security console:
 
 ```powershell
-python main.py --gui
+.venv\Scripts\python.exe main.py --gui
 ```
 
 Or launch the UI module directly:
 
 ```powershell
-python -m src.ui.app
+.venv\Scripts\python.exe -m src.ui.app
 ```
 
 ### Desktop Console Features
@@ -164,23 +187,35 @@ python -m src.ui.app
 - **Incidents**: Lifecycle management (open → investigating → mitigated → resolved), analyst notes, related event navigation.
 - **Settings**: Environment paths, database health, schema version, record counts, checkpoint metadata, sensor status.
 
+### Screenshots
+
+| Overview | Events |
+|---|---|
+| ![Mini SOC overview](screenshots/overview.png) | ![Mini SOC events](screenshots/events.png) |
+
+| Detections | Incidents |
+|---|---|
+| ![Mini SOC detections](screenshots/detections.png) | ![Mini SOC incidents](screenshots/incidents.png) |
+
 ---
 
 ## 6. Running Tests
 
 ```powershell
-python -m pytest -v
+.venv\Scripts\python.exe -m pytest -v
 ```
 
 Run a specific test file:
 
 ```powershell
-python -m pytest -v tests/test_ui.py        # PySide6 desktop UI tests
-python -m pytest -v tests/test_database.py   # SQLite persistence tests
-python -m pytest -v tests/test_detection.py  # Detection engine tests
+.venv\Scripts\python.exe -m pytest -v tests/test_ui.py        # PySide6 desktop UI tests
+.venv\Scripts\python.exe -m pytest -v tests/test_database.py  # SQLite persistence tests
+.venv\Scripts\python.exe -m pytest -v tests/test_detection.py # Detection engine tests
 ```
 
-Current test suite: **111 tests passing** across config, events, database, collectors, detection, reporting, security, and UI.
+The tests use mocks and temporary databases for most collector and persistence checks; they do not require access to a real Security Event Log. The UI tests run without needing to open the desktop window.
+
+The suite covers configuration, events, database, collectors, detection, reporting, security, and UI. The test count can change as tests are added.
 
 ---
 
@@ -191,7 +226,7 @@ Current test suite: **111 tests passing** across config, events, database, colle
 | Project Structure | ✅ Complete | Modular package skeleton: core, collectors, database, detection, incidents, ui |
 | Central Configuration | ✅ Complete | Deterministic path resolution, data/log directory creation, zero secrets |
 | Security Event Model | ✅ Complete | Pydantic v2 `SecurityEvent` with UUIDv4, UTC enforcement, extensible attributes |
-| SQLite Persistence | ✅ Complete | Versioned schema v2, indexes, checkpoints, EventRepository, IncidentRepository |
+| SQLite Persistence | ✅ Complete | Versioned schema, indexes, checkpoints, EventRepository, IncidentRepository |
 | Host Telemetry Collectors | ✅ Complete | Process and network connection collectors with deduplication |
 | Windows Event Log Collector | ✅ Complete | Security & System logs (IDs 4624, 4625, 1102, 7045), persistent checkpoints |
 | Monitoring Orchestrator | ✅ Complete | HostMonitorService for polling with error isolation |
@@ -199,4 +234,4 @@ Current test suite: **111 tests passing** across config, events, database, colle
 | Incident Workflow | ✅ Complete | Alert → Incident conversion, status lifecycle, analyst notes, SQLite persistence |
 | Reporting & Export | ✅ Complete | CSV and JSON export for events, incidents, and summaries |
 | Desktop Console (PySide6) | ✅ Complete | 5-view dashboard with dark theme, severity badges, filters, triage actions, CSV export |
-| Automated Test Suite | ✅ Complete | 111 tests covering all subsystems including offscreen UI tests |
+| Automated Test Suite | ✅ Complete | Tests cover all subsystems including UI tests |
