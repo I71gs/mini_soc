@@ -47,6 +47,262 @@ The project follows a modular, decoupled architecture:
 
 ---
 
+## Backend Concepts
+
+This section explains the serverless/backend implementation in Mini SOC. "Backend" in this project means the local Python collection, normalization, persistence, detection, and incident-processing layers; it does not mean a web server or cloud service.
+
+### End-to-End Data Flow
+
+1. **Bootstrap** - `main.py` creates the application configuration, opens or initializes the SQLite database, and initializes the schema.
+2. **Collection** - the Windows Event Log collector and host monitoring service read local telemetry.
+3. **Normalization** - each source is converted into a Pydantic `SecurityEvent` with a consistent field contract.
+4. **Persistence** - repositories serialize events and incidents to SQLite using parameterized queries and transactions.
+5. **Detection** - `DetectionEngine` evaluates a snapshot of stored events with independent rule classes.
+6. **Incident management** - a detection alert can be converted into an `Incident`, then triaged and persisted.
+7. **Presentation** - the PySide6 window reads the repositories and cached backend state to update dashboard views and exports.
+
+```text
+Windows Event Log / psutil
+            |
+            v
+Collector -> SecurityEvent -> EventRepository -> SQLite
+                                  |
+                                  v
+                          DetectionEngine
+                                  |
+                                  v
+                         DetectionAlert
+                                  |
+                                  v
+                         IncidentManager -> IncidentRepository
+```
+
+### Application Entry Points
+
+- `main.py` is the primary entry point.
+  - Running it without arguments executes one headless collection/detection cycle.
+  - Running it with `--gui` starts the PySide6 desktop application.
+- `src/ui/app.py::run_app()` initializes configuration and SQLite, creates `MainWindow`, and starts the Qt event loop.
+- `src/ui/main_window.py::MainWindow` owns the desktop application's backend wiring. It creates repositories, the host monitor, the Windows Event Log collector, the detection engine, and the incident manager.
+- In GUI mode, manual **Poll Sensors** performs a collection cycle. The Qt UI also refreshes database-backed views every 30 seconds without automatically starting a new sensor poll.
+
+### Configuration and Paths
+
+`AppConfig` in `src/core/config.py` centralizes runtime paths and metadata:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `app_name` | `Mini SOC` | Application display name |
+| `version` | `0.1.0` | Application version |
+| `project_root` | Directory containing the repository | Base directory for all relative storage |
+| `data_dir` | `<project_root>/data` | Local application storage |
+| `database_path` | `<project_root>/data/minisoc.db` | SQLite database |
+| `log_dir` | `<project_root>/data/logs` | Operational log files |
+
+Relative paths are resolved against `project_root`, and absolute paths must remain inside the project root. This blocks path traversal and ensures that custom storage locations do not escape the application directory. `ensure_directories()` creates the data and log directories. App configuration does not contain credentials or remote endpoints.
+
+### Security Event Contract
+
+`SecurityEvent` in `src/core/events.py` is the canonical backend event model.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `event_id` | UUID | Unique event identity; generated with UUIDv4 |
+| `timestamp` | timezone-aware `datetime` | UTC event time |
+| `source` | string | Collector or source, for example `process_collector` or `windows_event_log` |
+| `category` | `EventCategory` or string | Domain such as PROCESS, NETWORK, AUTHENTICATION, or SYSTEM |
+| `event_type` | string | Stable action name such as `process_started` or `windows_logon_failed` |
+| `severity` | `EventSeverity` | `INFO`, `LOW`, `MEDIUM`, `HIGH`, or `CRITICAL` |
+| `host` | string | Hostname or Windows computer name |
+| `description` | string | Human-readable event summary |
+| `attributes` | dictionary | Source-specific metadata, fields, IDs, paths, IPs, accounts, and ports |
+| `schema_version` | string | Event contract version; currently `1.0` |
+
+Pydantic validates event fields when a `SecurityEvent` is created or loaded. Empty source, host, event type, description, and schema strings are rejected. Category and severity values are normalized to uppercase. Naive timestamps are rejected and timezone-aware timestamps are converted to UTC. UUID, enum, datetime, and nested attribute values are converted to SQLite/JSON primitives by `to_db_record()` and reconstructed by `from_db_record()`.
+
+### Collector Concepts
+
+#### Process Collector
+
+`ProcessCollector` uses `psutil.process_iter()` to snapshot running Windows processes. It records PID, executable name, creation time, executable path, and username where accessible.
+
+The process key is `(PID, create_time)`. This combination avoids treating normal PID reuse as the same process instance. The collector maintains an in-memory set of known process keys:
+
+- on the first snapshot, processes are compared against an empty set or an explicit baseline;
+- an instance not in the known set produces a `process_started` event;
+- the known set is replaced with the current snapshot after each cycle.
+
+Protected or disappeared processes are skipped without crashing the collection cycle. Access-denied executable or username details are left as `None`.
+
+#### Network Collector
+
+`NetworkCollector` uses `psutil.net_connections(kind="inet")` to snapshot Internet-family sockets. It normalizes IPv4/IPv6 and TCP/UDP protocol names and records local/remote endpoints, status, and associated PID.
+
+A connection key includes protocol, local address and port, remote address and port, and PID. The first unseen key emits `network_connection_observed`. Baseline initialization and subsequent polling prevent the same connection key from being reported repeatedly within a single in-memory monitoring session.
+
+Listening sockets and other malformed or inaccessible entries are handled defensively; access-denied socket enumeration produces no events for that cycle rather than stopping the application.
+
+#### Windows Event Log Collector
+
+`WindowsEventCollector` uses pywin32 native EvtQuery/EvtNext/EvtRender APIs. The default channels and event IDs are:
+
+| Channel | IDs | Normalized result |
+|---|---:|---|
+| Security | 4624 | Successful Windows logon |
+| Security | 4625 | Failed Windows logon |
+| Security | 1102 | Security audit log cleared |
+| System | 7045 | Windows service installed |
+
+Raw event XML is parsed for the system header and named `EventData` values, then normalized into the common `SecurityEvent` model. The default initial poll reads up to 100 records per channel in reverse direction, reverses them to chronological order, and advances a persistent checkpoint. Later polls use the checkpoint and forward direction.
+
+A channel checkpoint is the highest successfully processed Windows `EventRecordID`, not a wall-clock timestamp. The collector detects channel reset/rollover by comparing the newest record ID with the stored checkpoint. Missing channels and denied access are reported once per channel and collection continues with other sources.
+
+#### Host Monitoring Orchestration
+
+`HostMonitorService` coordinates process and network collection. It supports one collection cycle or a daemon polling loop at a configurable interval (5 seconds by default). Each collector is invoked independently, so an exception in one does not prevent the other from running. `start()` and `stop()` provide thread lifecycle control, and `stop()` waits up to a configurable timeout.
+
+### SQLite Persistence
+
+`DatabaseManager` opens a short-lived SQLite connection for every repository operation. Connections enable foreign-key enforcement, use `sqlite3.Row`, have a 10-second busy timeout, commit successful operations, roll back exceptions, and close reliably.
+
+The database is located at `data/minisoc.db` by default. It is a file-backed local database; tests can use `:memory:` databases.
+
+#### Schema and Migrations
+
+The schema is versioned in the `schema_version` table. `initialize_database()` safely applies missing migrations without overwriting existing records.
+
+| Version | Tables/Indexes added | Purpose |
+|---:|---|---|
+| 1 | `security_events`, event indexes, `schema_version` | Core normalized telemetry |
+| 2 | `event_log_checkpoints` | Per-channel Windows Event Log positions |
+| 3 | `incidents`, incident indexes | Persisted analyst cases |
+
+`security_events` stores every normalized event as primitive values. JSON in the `attributes` column preserves source-specific fields. Its indexes support timestamp, severity, source, and event-type queries.
+
+`event_log_checkpoints` maps channel names to `last_record_id` and update time. It prevents replay of already processed Windows events across application restarts.
+
+`incidents` stores title, description, severity, status, source, related event IDs, attributes, notes, and creation time. JSON columns preserve event IDs, attributes, and analyst notes.
+
+#### Repositories
+
+Repositories are the boundary between domain objects and SQLite:
+
+- `EventRepository` inserts individual/batched events, atomically inserts events with checkpoints, retrieves by UUID, counts records, and lists filtered events newest-first.
+- `CheckpointRepository` gets, updates, lists, and resets per-channel record IDs.
+- `IncidentRepository` inserts or updates incidents, retrieves one incident, lists incidents by status, and updates incident state.
+
+The repository API uses named or positional parameters instead of interpolating user input into SQL. Event and incident JSON fields are converted explicitly before database storage.
+
+### Atomic Event/Checkpoint Transactions
+
+Windows Event Log ingestion is checkpointed atomically. `save_events_with_checkpoint()` inserts all normalized events and updates the channel checkpoint in the same SQLite transaction. If event insertion or checkpoint update fails, the transaction is rolled back.
+
+The collector also maintains an in-session record-key set and checks the persisted checkpoint, providing duplicate protection even if the same record arrives during repeated reads. The persisted checkpoint advances only to the highest successfully normalized and inserted record.
+
+### Detection Engine
+
+`DetectionEngine` combines a sequence of independent `DetectionRule` implementations and flattens their `DetectionAlert` results. The default engine contains three rules:
+
+#### Suspicious Process Rule
+
+The rule examines `process_started` events and flags names in a built-in set of administrative or abuse tools, including `rundll32.exe`, `regsvr32.exe`, `wmic.exe`, `mshta.exe`, `certutil.exe`, `bitsadmin.exe`, `netsh.exe`, `bcdedit.exe`, and `psexec.exe`.
+
+It also applies command-pattern checks for `cmd.exe` and PowerShell. The alert severity is `HIGH`, and the original event UUID is attached through `related_event_ids`.
+
+#### Failed Logon Spike Rule
+
+The rule scans `windows_logon_failed` events, groups them by `account_name`, and raises one `HIGH` alert when an account has at least three failures in the current observation window. The alert links every grouped event and includes the account name and failed count.
+
+The observation window is the event snapshot supplied to `DetectionEngine`, not a continuously scheduled rolling-time rule. In GUI mode this is controlled by the selected Overview timeframe.
+
+#### Suspicious Outbound Rule
+
+The rule examines `network_connection_observed` events with a remote IP and remote port. It flags external destinations on risky service ports such as 22, 23, 3389, 445, 4444-4446, 8080, and 8443. Loopback and common private IPv4 ranges are excluded. The alert severity is `MEDIUM`.
+
+Alerts are not a verdict: they identify patterns requiring analyst validation and are converted only to incidents when the analyst acts or when GUI startup/refresh finds no existing incident set and alerts are present.
+
+### Incident Model and Lifecycle
+
+An `Incident` is a triage case created from one or more detection alerts. It contains a UUID, title, description, severity, status, source, related event IDs, attributes, analyst notes, and UTC creation time.
+
+The supported workflow is:
+
+```text
+open -> investigating -> mitigated -> resolved
+```
+
+`IncidentManager`:
+
+- converts `DetectionAlert` objects into `Incident` objects;
+- stores new incidents through `IncidentRepository`;
+- hydrates incidents from SQLite;
+- updates status in memory and SQLite;
+- appends analyst notes and persists the complete incident.
+
+The manager does not own an automated containment or remediation system. Incident status and notes represent analyst workflow only.
+
+### Reporting and Export
+
+`ReportingExporter` creates common artifacts for analyst use:
+
+- event CSV (core event fields);
+- incident CSV (core incident fields);
+- event JSON (including `attributes`);
+- incident JSON (including attributes and notes);
+- summary JSON (event severity, incident severity, incident status, and generated time).
+
+Parent directories are created automatically for export destinations.
+
+### Security and Logging
+
+The backend has multiple defensive measures:
+
+- no network API server, cloud telemetry, secrets store, or remote credential configuration;
+- storage paths are restricted to the project root;
+- SQLite uses parameterized statements;
+- timestamps are normalized and event fields are validated;
+- local log entries are sanitized with `redact_sensitive_data()`;
+- sensitive key names containing password, secret, token, API key, authorization, cookie, session, JWT, private key, or access key are replaced with `[REDACTED]`;
+- collector exceptions are isolated so a process, network, or Windows channel failure does not crash the application.
+
+Operational logs are written to `data/logs/minisoc.log`. The backend uses an INFO-level project logger by default, with file-only logging in the normal application process.
+
+### GUI-to-Backend Synchronization
+
+`MainWindow.refresh_all_data()` is the main GUI synchronization method:
+
+1. optionally polls process, network, and Windows Event Log collectors;
+2. loads up to 500 events for the selected 1-hour, 24-hour, 7-day, or all-time timeframe;
+3. evaluates the detection engine over that event snapshot;
+4. loads or creates in-memory incidents;
+5. refreshes overview metrics, event/detection grids, incident panels, and settings diagnostics;
+6. updates the last-synchronization timestamp.
+
+The UI caches the latest backend snapshot for fast view updates. Repositories remain the source of persistence and can be queried directly by the same application components.
+
+### Backend Extension Guide
+
+To add a new telemetry source:
+
+1. create a collector that produces `SecurityEvent` instances;
+2. add source/category-specific fields to `attributes`;
+3. persist batches through `EventRepository`;
+4. wire the collector into `HostMonitorService` or `MainWindow`;
+5. add tests for collection, normalization, persistence, and failure handling.
+
+To add a detection rule:
+
+1. subclass `DetectionRule`;
+2. set `name`, `description`, and `severity`;
+3. implement `evaluate(events)` and return `DetectionAlert` objects;
+4. link relevant event UUIDs through `related_event_ids`;
+5. pass the rule into `DetectionEngine` or add it to the default rule list;
+6. add positive and false-positive test cases.
+
+SQLite schema changes should create a new migration version in `schema.py` and a corresponding table/repository test. Existing event and incident fields should not be renamed in place without migration and deserialization compatibility.
+
+---
+
 ## 3. Project Directory Structure
 
 ```
@@ -60,7 +316,9 @@ mini-soc/
 │   ├── __init__.py
 │   ├── core/
 │   │   ├── config.py               # AppConfig
-│   │   └── events.py               # SecurityEvent model and enums
+│   │   ├── events.py               # SecurityEvent model and enums
+│   │   ├── logging_utils.py        # Operational and sanitized logging
+│   │   └── security.py             # Redaction and safe path validation
 │   ├── collectors/
 │   │   ├── process_collector.py     # Windows process monitor (psutil)
 │   │   ├── network_collector.py     # Network connection monitor (psutil)
@@ -77,6 +335,8 @@ mini-soc/
 │   ├── incidents/
 │   │   ├── models.py               # Incident dataclass
 │   │   └── manager.py              # IncidentManager
+│   ├── reporting/
+│   │   └── exporter.py             # CSV, JSON, and summary exporters
 │   └── ui/
 │       ├── app.py                  # run_app() PySide6 entry point
 │       ├── main_window.py          # MainWindow shell with sidebar + header
