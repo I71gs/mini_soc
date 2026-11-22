@@ -1,12 +1,14 @@
 """Centralized application configuration for Mini SOC.
 
 Defines core paths, application metadata, and directory management.
-All default paths resolve relative to the project root directory rather than
-the current working directory to ensure deterministic behavior across execution environments.
+Default storage is per-user and OS-specific; relative overrides resolve from
+the project root rather than the current working directory.
 """
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import sys
 
 from src.core.security import validate_safe_relative_path
 
@@ -16,6 +18,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_APP_NAME = "Mini SOC"
 DEFAULT_APP_VERSION = "0.1.0"
+DATA_DIRECTORY_NAME = "Mini SOC"
+
+
+def _default_data_directory() -> Path:
+    """Return a per-user data path outside the project checkout by default."""
+    override = os.environ.get("MINISOC_DATA_DIR")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("MINISOC_DATA_DIR must be an absolute path")
+        return path
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / DATA_DIRECTORY_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / DATA_DIRECTORY_NAME
+
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return data_home / "mini-soc"
 
 
 @dataclass
@@ -26,7 +49,8 @@ class AppConfig:
         app_name: Name of the application.
         version: Semantic version of the application.
         project_root: Root directory of the Mini SOC project.
-        data_dir: Directory used for local application storage.
+        data_dir: Directory used for local application storage. Defaults to a per-user,
+            non-synchronized OS data directory; MINISOC_DATA_DIR can override it.
         database_path: File path to the SQLite database.
         log_dir: Directory used for application log files.
         auto_create_dirs: If True, creates required data directories on initialization.
@@ -38,15 +62,19 @@ class AppConfig:
     data_dir: Path | None = None
     database_path: Path | None = None
     log_dir: Path | None = None
+    retention_days: int = 90
     auto_create_dirs: bool = True
 
     def __post_init__(self) -> None:
         """Resolve all paths relative to project root and ensure directories exist."""
+        if self.retention_days < 1:
+            raise ValueError("retention_days must be at least 1")
+
         # Ensure project root is absolute and resolved
         self.project_root = self.project_root.resolve()
 
         if self.data_dir is None:
-            self.data_dir = (self.project_root / "data").resolve()
+            self.data_dir = _default_data_directory().resolve()
         else:
             self.data_dir = Path(self.data_dir)
             if not self.data_dir.is_absolute():
@@ -72,23 +100,20 @@ class AppConfig:
             else:
                 self.log_dir = self.log_dir.resolve()
 
-        self._validate_paths_within_root()
-
         if self.auto_create_dirs:
             self.ensure_directories()
 
-    def _validate_paths_within_root(self) -> None:
-        """Ensure the configured storage paths remain under the project root."""
-        for path in (self.data_dir, self.database_path, self.log_dir):
-            try:
-                path.relative_to(self.project_root)
-            except ValueError as err:
-                raise ValueError(f"Configured path escapes project root: {path}") from err
+    @property
+    def legacy_database_path(self) -> Path:
+        """Return the historical repository-local database path for safe migration."""
+        return (self.project_root / "data" / "minisoc.db").resolve()
 
     def ensure_directories(self) -> None:
         """Safely create required application directories on disk."""
         assert self.data_dir is not None
+        assert self.database_path is not None
         assert self.log_dir is not None
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)

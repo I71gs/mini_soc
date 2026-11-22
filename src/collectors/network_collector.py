@@ -76,6 +76,7 @@ class NetworkCollector:
         """
         self.repository = repository
         self._known_connection_keys: set[tuple[str, str, int, str | None, int | None, int | None]] = set()
+        self.last_error: str | None = None
 
     def get_snapshot(self) -> list[NetworkConnectionInfo]:
         """Enumerate active network connections safely.
@@ -87,13 +88,16 @@ class NetworkCollector:
             list[NetworkConnectionInfo]: Currently active network connections.
         """
         connections: list[NetworkConnectionInfo] = []
+        self.last_error = None
 
         try:
             raw_conns = psutil.net_connections(kind="inet")
         except psutil.AccessDenied as err:
+            self.last_error = f"Access denied: {err}"
             logger.warning("AccessDenied when querying network connections: %s", err)
             return []
         except Exception as err:
+            self.last_error = str(err)
             logger.warning("Failed to enumerate network connections: %s", err)
             return []
 
@@ -141,6 +145,8 @@ class NetworkCollector:
     def initialize_baseline(self) -> None:
         """Populate known connections from current snapshot without emitting events."""
         snapshot = self.get_snapshot()
+        if self.last_error:
+            return
         self._known_connection_keys = {conn.connection_key for conn in snapshot}
 
     def collect_events(self) -> list[SecurityEvent]:
@@ -152,6 +158,8 @@ class NetworkCollector:
             list[SecurityEvent]: New network_connection_observed security events.
         """
         snapshot = self.get_snapshot()
+        if self.last_error:
+            return []
         current_keys: set[tuple[str, str, int, str | None, int | None, int | None]] = set()
         new_events: list[SecurityEvent] = []
 

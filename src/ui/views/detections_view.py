@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.events import EventSeverity
+from src.core.security import redact_sensitive_data, safe_json_dumps, spreadsheet_safe
 from src.detection.rules import DetectionAlert
 from src.ui.components.severity_badge import SeverityBadge, make_badge_cell_widget
 
@@ -34,6 +35,7 @@ class DetectionsView(QWidget):
     refresh_requested = Signal()
     create_incident_requested = Signal(object)  # emits DetectionAlert
     open_related_event_requested = Signal(str)   # emits event_id string
+    review_state_changed = Signal(str, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -175,14 +177,27 @@ class DetectionsView(QWidget):
 
         layout.addWidget(splitter, 1)
 
+        self.lbl_empty_state = QLabel()
+        self.lbl_empty_state.setWordWrap(True)
+        self.lbl_empty_state.setStyleSheet("color: #facc15; padding: 4px;")
+        layout.addWidget(self.lbl_empty_state)
+
         # Status footer bar
         self.lbl_count = QLabel("Showing 0 detections")
         self.lbl_count.setStyleSheet("color: #94a3b8; font-size: 11px;")
         layout.addWidget(self.lbl_count)
 
-    def set_alerts(self, alerts: Sequence[DetectionAlert]) -> None:
+    def set_alerts(
+        self,
+        alerts: Sequence[DetectionAlert],
+        reviewed_alert_keys: Sequence[str] | None = None,
+        empty_context: str = "",
+    ) -> None:
         """Update the table with a new batch of detection alerts."""
         self._all_alerts = list(alerts)
+        if reviewed_alert_keys is not None:
+            self._reviewed_alert_keys = set(reviewed_alert_keys)
+        self._empty_context = empty_context
 
         # Update available rule choices dynamically
         current_rule = self.rule_filter.currentText()
@@ -199,7 +214,7 @@ class DetectionsView(QWidget):
 
     def _alert_key(self, alert: DetectionAlert) -> str:
         """Construct a unique key for a detection alert."""
-        return f"{alert.rule_name}_{alert.title}_{alert.detected_at.isoformat()}"
+        return alert.alert_key
 
     def _apply_filters(self) -> None:
         """Filter detection alerts."""
@@ -246,7 +261,9 @@ class DetectionsView(QWidget):
 
         for row, alert in enumerate(self._filtered_alerts):
             time_str = alert.detected_at.strftime("%Y-%m-%d %H:%M:%S")
-            self.table.setItem(row, 0, QTableWidgetItem(time_str))
+            time_item = QTableWidgetItem(time_str)
+            time_item.setData(Qt.ItemDataRole.UserRole, alert.alert_key)
+            self.table.setItem(row, 0, time_item)
 
             badge = SeverityBadge(alert.severity)
             self.table.setCellWidget(row, 1, make_badge_cell_widget(badge))
@@ -263,6 +280,16 @@ class DetectionsView(QWidget):
 
         self.table.setSortingEnabled(True)
         self.lbl_count.setText(f"Showing {len(self._filtered_alerts):,} of {len(self._all_alerts):,} detections")
+        if self._filtered_alerts:
+            self.lbl_empty_state.clear()
+        elif self._all_alerts:
+            self.lbl_empty_state.setText(
+                "No detections match the current filters. Clear search and filter selections."
+            )
+        else:
+            self.lbl_empty_state.setText(
+                self._empty_context or "No detections were produced from the current event set."
+            )
         self.details_text.clear()
         self.btn_mark_reviewed.setEnabled(False)
         self.btn_create_incident.setEnabled(False)
@@ -272,10 +299,9 @@ class DetectionsView(QWidget):
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             return None
-        row_index = selected_rows[0].row()
-        if 0 <= row_index < len(self._filtered_alerts):
-            return self._filtered_alerts[row_index]
-        return None
+        item = self.table.item(selected_rows[0].row(), 0)
+        alert_key = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return next((alert for alert in self._filtered_alerts if alert.alert_key == alert_key), None)
 
     def _on_selection_changed(self) -> None:
         alert = self._get_selected_alert()
@@ -310,7 +336,7 @@ class DetectionsView(QWidget):
             "attributes": alert.attributes,
             "status": "Reviewed" if is_reviewed else "Active",
         }
-        self.details_text.setPlainText(json.dumps(details_dict, indent=2))
+        self.details_text.setPlainText(json.dumps(redact_sensitive_data(details_dict), indent=2))
 
     def _toggle_reviewed(self) -> None:
         alert = self._get_selected_alert()
@@ -323,6 +349,7 @@ class DetectionsView(QWidget):
         else:
             self._reviewed_alert_keys.add(key)
 
+        self.review_state_changed.emit(key, key in self._reviewed_alert_keys)
         self._apply_filters()
 
     def _create_incident(self) -> None:
@@ -355,7 +382,7 @@ class DetectionsView(QWidget):
                 ])
                 for a in self._filtered_alerts:
                     is_reviewed = self._alert_key(a) in self._reviewed_alert_keys
-                    writer.writerow([
+                    writer.writerow([spreadsheet_safe(value) if isinstance(value, str) else value for value in (
                         a.rule_name,
                         a.title,
                         a.severity.value,
@@ -364,8 +391,8 @@ class DetectionsView(QWidget):
                         "Reviewed" if is_reviewed else "Active",
                         a.description,
                         ";".join(a.related_event_ids),
-                        json.dumps(a.attributes),
-                    ])
+                        safe_json_dumps(a.attributes),
+                    )])
             QMessageBox.information(self, "Export Successful", f"Exported {len(self._filtered_alerts)} detections to:\n{path}")
         except Exception as err:
             QMessageBox.critical(self, "Export Error", f"Failed to export CSV: {err}")

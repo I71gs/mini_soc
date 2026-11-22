@@ -26,6 +26,7 @@ def _create_mock_process(
     proc.create_time.return_value = create_time
     proc.exe.return_value = exe
     proc.username.return_value = username
+    proc.cmdline.return_value = []
     return proc
 
 
@@ -76,6 +77,19 @@ def test_missing_or_inaccessible_process_information() -> None:
     assert snapshot[0].name == "protected.exe"
     assert snapshot[0].exe is None
     assert snapshot[0].username is None
+    assert collector.permission_denied_count == 1
+
+
+def test_access_denied_basic_metadata_counts_process_once() -> None:
+    mock_process = _create_mock_process(204)
+    mock_process.name.side_effect = psutil.AccessDenied(204)
+
+    with patch("psutil.process_iter", return_value=[mock_process]):
+        collector = ProcessCollector()
+        snapshot = collector.get_snapshot()
+
+    assert snapshot == []
+    assert collector.permission_denied_count == 1
 
 
 def test_process_start_event_generation() -> None:
@@ -98,6 +112,26 @@ def test_process_start_event_generation() -> None:
     assert event.attributes["exe"] == "C:\\agent.exe"
     assert event.attributes["username"] == "Admin"
     assert event.attributes["create_time"] == 1700000020.0
+    assert event.attributes["command_line"] == ""
+
+
+def test_command_line_collection_redacts_common_credentials() -> None:
+    mock_process = _create_mock_process(302, "powershell.exe")
+    mock_process.cmdline.return_value = [
+        "powershell.exe",
+        "-NoProfile",
+        "-enc",
+        "encoded-payload",
+        "--password",
+        "super-secret",
+    ]
+    with patch("psutil.process_iter", return_value=[mock_process]):
+        events = ProcessCollector().collect_events()
+
+    command_line = events[0].attributes["command_line"]
+    assert "-enc encoded-payload" in command_line
+    assert "super-secret" not in command_line
+    assert "[REDACTED]" in command_line
 
 
 def test_no_duplicate_events_on_repeated_polls() -> None:
@@ -186,3 +220,17 @@ def test_initialize_baseline() -> None:
         events = collector.collect_events()
 
     assert len(events) == 0
+
+
+def test_failed_snapshot_does_not_clear_process_baseline() -> None:
+    process = _create_mock_process(702, "existing.exe", 1700000061.0)
+    collector = ProcessCollector()
+    with patch("psutil.process_iter", return_value=[process]):
+        collector.initialize_baseline()
+
+    with patch("psutil.process_iter", side_effect=RuntimeError("Process table unavailable")):
+        assert collector.collect_events() == []
+        assert collector.last_error == "Process table unavailable"
+
+    with patch("psutil.process_iter", return_value=[process]):
+        assert collector.collect_events() == []

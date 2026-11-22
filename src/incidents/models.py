@@ -20,6 +20,7 @@ class Incident:
     status: str = "open"
     source: str = "detection_engine"
     related_event_ids: list[str] = field(default_factory=list)
+    alert_key: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -34,6 +35,7 @@ class Incident:
             "status": self.status,
             "source": self.source,
             "related_event_ids": self.related_event_ids,
+            "alert_key": self.alert_key,
             "attributes": self.attributes,
             "notes": self.notes,
             "created_at": self.created_at.isoformat(),
@@ -64,6 +66,7 @@ class Incident:
             status=str(raw.get("status", "open")),
             source=str(raw.get("source", "detection_engine")),
             related_event_ids=list(raw.get("related_event_ids") or []),
+            alert_key=raw.get("alert_key"),
             attributes=dict(raw.get("attributes") or {}),
             notes=list(raw.get("notes") or []),
             created_at=created_at_dt,

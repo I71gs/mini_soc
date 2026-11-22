@@ -7,6 +7,7 @@ for newly observed processes across polling cycles.
 
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any
 
 import psutil
@@ -15,6 +16,17 @@ from src.core.events import EventCategory, EventSeverity, SecurityEvent
 from src.database.event_repository import EventRepository
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ARGUMENT = re.compile(
+    r"(?i)((?:--?|/)(?:password|passwd|secret|token|api[-_]?key|authorization)"
+    r"(?:=|:|\s+))([^\s]+)"
+)
+
+
+def _safe_command_line(arguments: list[str]) -> str:
+    """Keep useful execution context while masking common inline credentials."""
+    command_line = " ".join(arguments)
+    return _SENSITIVE_ARGUMENT.sub(r"\1[REDACTED]", command_line)
 
 
 @dataclass(frozen=True)
@@ -34,6 +46,7 @@ class ProcessInfo:
     create_time: float
     exe: str | None = None
     username: str | None = None
+    command_line: str | None = None
 
     @property
     def process_key(self) -> tuple[int, float]:
@@ -42,7 +55,11 @@ class ProcessInfo:
 
 
 class ProcessCollector:
-    """Monitors Windows processes and emits SecurityEvents for newly started processes."""
+    """Monitors Windows processes and emits SecurityEvents for newly started processes.
+
+    ``permission_denied_count`` tracks unique process records with at least one
+    field blocked by Windows permissions during the latest snapshot.
+    """
 
     def __init__(self, repository: EventRepository | None = None) -> None:
         """Initialize the process collector.
@@ -52,17 +69,22 @@ class ProcessCollector:
         """
         self.repository = repository
         self._known_process_keys: set[tuple[int, float]] = set()
+        self.last_error: str | None = None
+        self.permission_denied_count = 0
 
     def get_snapshot(self) -> list[ProcessInfo]:
         """Enumerate all currently running processes safely.
 
         Catches AccessDenied, NoSuchProcess, and ZombieProcess errors to ensure
         the collection cycle does not crash when encountering protected system processes.
+        ``permission_denied_count`` counts each affected process at most once.
 
         Returns:
             list[ProcessInfo]: Current running processes.
         """
         processes: list[ProcessInfo] = []
+        self.last_error = None
+        self.permission_denied_count = 0
 
         try:
             for proc in psutil.process_iter():
@@ -70,6 +92,7 @@ class ProcessCollector:
                 if info is not None:
                     processes.append(info)
         except Exception as err:
+            self.last_error = str(err)
             logger.warning("Failed during process iteration: %s", err)
 
         return processes
@@ -80,17 +103,23 @@ class ProcessCollector:
             pid = proc.pid
             name = proc.name() or "unknown"
             create_time = proc.create_time()
-        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            self.permission_denied_count += 1
+            return None
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
         except Exception as err:
             logger.debug("Unexpected error reading basic process info for PID %s: %s", getattr(proc, "pid", "?"), err)
             return None
 
         # Optional attributes that frequently trigger AccessDenied on system processes
+        access_denied = False
         exe = None
         try:
             exe = proc.exe()
-        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            access_denied = True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             pass
         except Exception:
             pass
@@ -98,10 +127,27 @@ class ProcessCollector:
         username = None
         try:
             username = proc.username()
-        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            access_denied = True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             pass
         except Exception:
             pass
+
+        command_line = None
+        try:
+            raw_arguments = proc.cmdline()
+            if isinstance(raw_arguments, list) and all(isinstance(arg, str) for arg in raw_arguments):
+                command_line = _safe_command_line(raw_arguments)
+        except psutil.AccessDenied:
+            access_denied = True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            pass
+        except Exception as err:
+            logger.debug("Unable to read command line for PID %s: %s", pid, err)
+
+        if access_denied:
+            self.permission_denied_count += 1
 
         return ProcessInfo(
             pid=pid,
@@ -109,11 +155,14 @@ class ProcessCollector:
             create_time=create_time,
             exe=exe,
             username=username,
+            command_line=command_line,
         )
 
     def initialize_baseline(self) -> None:
         """Populate known processes from current snapshot without emitting events."""
         snapshot = self.get_snapshot()
+        if self.last_error:
+            return
         self._known_process_keys = {proc.process_key for proc in snapshot}
 
     def collect_events(self) -> list[SecurityEvent]:
@@ -125,6 +174,8 @@ class ProcessCollector:
             list[SecurityEvent]: New process_started security events.
         """
         snapshot = self.get_snapshot()
+        if self.last_error:
+            return []
         current_keys: set[tuple[int, float]] = set()
         new_events: list[SecurityEvent] = []
 
@@ -143,6 +194,7 @@ class ProcessCollector:
                         "name": proc.name,
                         "exe": proc.exe,
                         "username": proc.username,
+                        "command_line": proc.command_line,
                         "create_time": proc.create_time,
                     },
                 )

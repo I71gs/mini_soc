@@ -200,14 +200,35 @@ class OverviewView(QWidget):
         alerts: Sequence[DetectionAlert],
         incidents: Sequence[Incident],
         last_collection_time: str,
+        system_health_status: str | None = None,
+        system_health_details: str | None = None,
+        total_incidents: int | None = None,
+        open_incidents: int | None = None,
     ) -> None:
         """Update metrics, host info, recent activity table, and recent detections table."""
         self.card_events.set_value(f"{total_events:,}", f"Displaying {len(events)} loaded")
-        self.card_detections.set_value(str(len(alerts)), "Evaluated by detection engine")
-        open_count = sum(1 for i in incidents if i.status == "open")
-        self.card_incidents.set_value(str(open_count), f"{len(incidents)} total incidents")
+        self.card_detections.set_value(
+            str(len(alerts)),
+            "Rule evidence evaluated independently of event page",
+        )
+        open_count = (
+            open_incidents
+            if open_incidents is not None
+            else sum(1 for i in incidents if i.status == "open")
+        )
+        total_incident_count = total_incidents if total_incidents is not None else len(incidents)
+        self.card_incidents.set_value(str(open_count), f"{total_incident_count:,} total incidents")
 
-        if len(alerts) > 5 or open_count > 2:
+        if total_events == 0:
+            self.card_health.set_value(
+                "Not Observed",
+                "No telemetry is stored; this does not establish that no activity occurred.",
+            )
+            self.card_health.value_label.setStyleSheet("color: #facc15; font-size: 24px; font-weight: bold;")
+        elif system_health_status and system_health_status != "healthy":
+            self.card_health.set_value(system_health_status.title(), system_health_details or "Check collector health")
+            self.card_health.value_label.setStyleSheet("color: #facc15; font-size: 24px; font-weight: bold;")
+        elif len(alerts) > 5 or open_count > 2:
             self.card_health.set_value("Attention", "Multiple security alerts flagged", )
             self.card_health.value_label.setStyleSheet("color: #f87171; font-size: 24px; font-weight: bold;")
         else:

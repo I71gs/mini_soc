@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.database.connection import DatabaseManager
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 SCHEMA_V1_STATEMENTS = [
     """
@@ -89,6 +89,20 @@ SCHEMA_V3_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_incidents_created_at
     ON incidents (created_at);
+    """,
+]
+
+SCHEMA_V4_STATEMENTS = [
+    "ALTER TABLE incidents ADD COLUMN alert_key TEXT;",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_alert_key
+    ON incidents (alert_key);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS detection_alert_states (
+        alert_key TEXT PRIMARY KEY,
+        reviewed_at TEXT NOT NULL
+    );
     """,
 ]
 
@@ -173,6 +187,20 @@ def initialize_schema(conn: sqlite3.Connection) -> int:
             (3, now_utc, "Added incident persistence table and indexes"),
         )
         current_version = 3
+
+    if current_version < 4:
+        for statement in SCHEMA_V4_STATEMENTS:
+            cursor.execute(statement)
+
+        now_utc = datetime.now(timezone.utc).isoformat()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO schema_version (version, applied_at, description)
+            VALUES (?, ?, ?);
+            """,
+            (4, now_utc, "Added stable detection review and incident deduplication state"),
+        )
+        current_version = 4
 
     return current_version
 

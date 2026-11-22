@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.core.events import SecurityEvent
+from src.core.security import redact_sensitive_data, safe_json_dumps, spreadsheet_safe
 from src.incidents.models import Incident
 
 
@@ -41,8 +42,7 @@ class ReportingExporter:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for event in events:
-                writer.writerow(
-                    {
+                row = {
                         "event_id": str(event.event_id),
                         "timestamp": event.timestamp.isoformat(),
                         "source": event.source,
@@ -53,7 +53,7 @@ class ReportingExporter:
                         "description": event.description,
                         "schema_version": event.schema_version,
                     }
-                )
+                writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
         return target
 
     @staticmethod
@@ -74,8 +74,7 @@ class ReportingExporter:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for incident in incidents:
-                writer.writerow(
-                    {
+                row = {
                         "incident_id": incident.incident_id,
                         "title": incident.title,
                         "description": incident.description,
@@ -85,7 +84,7 @@ class ReportingExporter:
                         "related_event_ids": ";".join(incident.related_event_ids),
                         "created_at": incident.created_at.isoformat(),
                     }
-                )
+                writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
         return target
 
     @staticmethod
@@ -102,7 +101,7 @@ class ReportingExporter:
                 "severity": event.severity.value,
                 "host": event.host,
                 "description": event.description,
-                "attributes": event.attributes,
+                "attributes": redact_sensitive_data(event.attributes),
                 "schema_version": event.schema_version,
             }
             for event in events
@@ -114,7 +113,7 @@ class ReportingExporter:
     def export_incidents_json(incidents: Sequence[Incident], destination: str | Path) -> Path:
         """Write a JSON export for incidents."""
         target = ReportingExporter._ensure_path(destination)
-        payload = [incident.to_dict() for incident in incidents]
+        payload = [redact_sensitive_data(incident.to_dict()) for incident in incidents]
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return target
 

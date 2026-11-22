@@ -5,7 +5,8 @@ normalizes records into SecurityEvent models, supports efficient XPath filtering
 handles access permissions gracefully, and enforces persistent checkpoint deduplication.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import ipaddress
 import logging
 import socket
 from typing import Any, Sequence
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover
     HAS_WIN32EVTLOG = False
 
 from src.core.events import EventCategory, EventSeverity, SecurityEvent
+from src.collectors.health import CollectorHealth
 from src.database.checkpoint_repository import CheckpointRepository
 from src.database.event_repository import EventRepository
 
@@ -33,20 +35,29 @@ DEFAULT_CHANNELS_CONFIG: dict[str, list[int]] = {
 }
 
 
-def _build_query_xpath(event_ids: list[int], last_record_id: int | None = None) -> str:
+def _build_query_xpath(
+    event_ids: list[int],
+    last_record_id: int | None = None,
+    start_time: datetime | None = None,
+) -> str:
     """Construct an efficient XPath query for Windows Event Log filtering.
 
     Args:
         event_ids: Target Windows Event IDs to capture.
         last_record_id: Optional EventRecordID checkpoint for incremental queries.
+        start_time: Optional UTC cutoff for the initial historical import.
 
     Returns:
         str: Formatted XPath query expression.
     """
     id_clause = " or ".join(f"EventID={eid}" for eid in event_ids)
+    conditions = [f"({id_clause})"]
     if last_record_id is not None and last_record_id > 0:
-        return f"*[System[({id_clause}) and EventRecordID > {last_record_id}]]"
-    return f"*[System[({id_clause})]]"
+        conditions.append(f"EventRecordID > {last_record_id}")
+    if start_time is not None:
+        cutoff = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        conditions.append(f"TimeCreated[@SystemTime >= '{cutoff}']")
+    return f"*[System[{' and '.join(conditions)}]]"
 
 
 def _parse_event_timestamp(system_time_str: str | None) -> datetime:
@@ -191,8 +202,18 @@ def normalize_event(parsed: dict[str, Any]) -> SecurityEvent:
 
     if event_id == 4625:
         account = data.get("TargetUserName") or "unknown"
+        source_ip = data.get("IpAddress") or "unknown"
         status = data.get("Status") or "unknown"
         desc = f"Windows logon failed for account '{account}' (Status: {status})"
+        attribution_complete = (
+            account.strip().casefold() not in {"", "-", "unknown", "<unknown>", "none", "null", "n/a"}
+            and computer.strip().casefold() not in {"", "-", "unknown", "<unknown>", "none", "null", "n/a"}
+        )
+        try:
+            source_ip = str(ipaddress.ip_address(source_ip.strip()))
+        except ValueError:
+            attribution_complete = False
+            source_ip = source_ip.strip() or "unknown"
         attrs = {
             "windows_event_id": 4625,
             "channel": channel,
@@ -204,7 +225,8 @@ def normalize_event(parsed: dict[str, Any]) -> SecurityEvent:
             "sub_status": data.get("SubStatus"),
             "failure_reason": data.get("FailureReason"),
             "workstation_name": data.get("WorkstationName"),
-            "source_ip": data.get("IpAddress"),
+            "source_ip": source_ip,
+            "attribution_status": "complete" if attribution_complete else "incomplete",
             "source_port": data.get("IpPort"),
             "process_name": data.get("ProcessName"),
         }
@@ -295,6 +317,7 @@ class WindowsEventCollector:
         checkpoint_repo: CheckpointRepository | None = None,
         channels: dict[str, list[int]] | None = None,
         max_records_per_channel: int = 100,
+        initial_backfill_days: int = 7,
     ) -> None:
         """Initialize WindowsEventCollector.
 
@@ -303,20 +326,33 @@ class WindowsEventCollector:
             checkpoint_repo: Optional CheckpointRepository for persistent channel checkpoints.
             channels: Mapping of channel names to list of target event IDs.
             max_records_per_channel: Maximum number of events to read per channel per poll.
+            initial_backfill_days: Recent history imported when a channel has no checkpoint.
         """
+        if max_records_per_channel < 1:
+            raise ValueError("max_records_per_channel must be at least 1")
+        if initial_backfill_days < 1:
+            raise ValueError("initial_backfill_days must be at least 1")
+
         self.repository = repository
         self.checkpoint_repo = checkpoint_repo
         self.channels = channels or dict(DEFAULT_CHANNELS_CONFIG)
         self.max_records_per_channel = max_records_per_channel
+        self.initial_backfill_days = initial_backfill_days
 
         self._in_memory_checkpoints: dict[str, int] = {}
         self._processed_keys: set[tuple[str, int]] = set()
         self._permission_warned_channels: set[str] = set()
+        self.health = CollectorHealth("Windows Event Log")
+        self._collection_errors: list[str] = []
 
     def get_checkpoint(self, channel: str) -> int | None:
         """Get the last processed EventRecordID for a channel."""
         if self.checkpoint_repo is not None:
-            return self.checkpoint_repo.get_checkpoint(channel)
+            persisted_checkpoint = self.checkpoint_repo.get_checkpoint(channel)
+            in_memory_checkpoint = self._in_memory_checkpoints.get(channel)
+            if self.repository is None and in_memory_checkpoint is not None:
+                return max(persisted_checkpoint or 0, in_memory_checkpoint)
+            return persisted_checkpoint
         return self._in_memory_checkpoints.get(channel)
 
     def set_checkpoint(self, channel: str, record_id: int) -> None:
@@ -347,6 +383,8 @@ class WindowsEventCollector:
         """
         if not HAS_WIN32EVTLOG:
             return False
+        query = None
+        raw = []
         try:
             query = win32evtlog.EvtQuery(
                 channel,
@@ -362,6 +400,13 @@ class WindowsEventCollector:
                         return True
         except Exception as err:
             logger.debug("Failed to inspect channel '%s' for rollover: %s", channel, err)
+        finally:
+            close_handle = getattr(win32evtlog, "EvtClose", None)
+            if close_handle is not None:
+                for handle in raw:
+                    close_handle(handle)
+                if query is not None:
+                    close_handle(query)
         return False
 
     def collect_events(self) -> list[SecurityEvent]:
@@ -374,21 +419,29 @@ class WindowsEventCollector:
             list[SecurityEvent]: Newly captured and normalized security events.
         """
         all_new_events: list[SecurityEvent] = []
+        self._collection_errors = []
+        if not HAS_WIN32EVTLOG:
+            message = "pywin32 is not available on this platform"
+            self.health.mark_unavailable(message)
+            logger.warning(message)
+            return []
 
         for channel, event_ids in self.channels.items():
             if not event_ids:
                 continue
-            channel_events = self._collect_channel(channel, event_ids)
-            all_new_events.extend(channel_events)
+            try:
+                channel_events = self._collect_channel(channel, event_ids)
+                all_new_events.extend(channel_events)
+            except Exception as err:
+                self._collection_errors.append(f"{channel}: {err}")
+                logger.exception("Windows Event Log collection failed for channel '%s'.", channel)
 
+        error = "; ".join(self._collection_errors) or None
+        self.health.record(len(all_new_events), error)
         return all_new_events
 
     def _collect_channel(self, channel: str, event_ids: list[int]) -> list[SecurityEvent]:
         """Collect events from a single channel using native EvtQuery."""
-        if not HAS_WIN32EVTLOG:
-            logger.warning("pywin32 (win32evtlog) is not available; skipping Windows Event Log collection.")
-            return []
-
         last_checkpoint = self.get_checkpoint(channel)
 
         # Check for event log rollover / reset
@@ -402,15 +455,13 @@ class WindowsEventCollector:
                 self.reset_checkpoint(channel)
                 last_checkpoint = None
 
-        xpath = _build_query_xpath(event_ids, last_checkpoint)
-
-        # If we have a checkpoint, query forward from the checkpoint.
-        # If no checkpoint exists (first collection), query backwards to get recent events.
-        flags = win32evtlog.EvtQueryChannelPath
-        if last_checkpoint is not None and last_checkpoint > 0:
-            flags |= win32evtlog.EvtQueryForwardDirection
-        else:
-            flags |= win32evtlog.EvtQueryReverseDirection
+        initial_import = last_checkpoint is None or last_checkpoint <= 0
+        initial_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self.initial_backfill_days)
+            if initial_import else None
+        )
+        xpath = _build_query_xpath(event_ids, last_checkpoint, initial_cutoff)
+        flags = win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryForwardDirection
 
         try:
             query_handle = win32evtlog.EvtQuery(channel, flags, xpath)
@@ -425,31 +476,65 @@ class WindowsEventCollector:
                     err,
                 )
                 self._permission_warned_channels.add(channel)
+            self._collection_errors.append(f"{channel}: {err}")
             return []
 
-        raw_events = []
+        imported_events: list[SecurityEvent] = []
         try:
-            raw_events = win32evtlog.EvtNext(query_handle, self.max_records_per_channel)
-        except Exception as err:
-            logger.warning("Failed to fetch records from channel '%s': %s", channel, err)
-            return []
+            while True:
+                try:
+                    raw_events = win32evtlog.EvtNext(
+                        query_handle, self.max_records_per_channel
+                    )
+                except Exception as err:
+                    self._collection_errors.append(f"{channel}: {err}")
+                    logger.warning("Failed to fetch records from channel '%s': %s", channel, err)
+                    break
 
-        if not raw_events:
-            return []
+                if not raw_events:
+                    break
 
-        xml_records: list[str] = []
-        for handle in raw_events:
-            try:
-                xml_str = win32evtlog.EvtRender(handle, win32evtlog.EvtRenderEventXml)
-                xml_records.append(xml_str)
-            except Exception as err:
-                logger.debug("Failed to render event handle on channel '%s': %s", channel, err)
+                xml_records: list[str] = []
+                render_failed = False
+                close_handle = getattr(win32evtlog, "EvtClose", None)
+                try:
+                    for handle in raw_events:
+                        try:
+                            xml_records.append(
+                                win32evtlog.EvtRender(handle, win32evtlog.EvtRenderEventXml)
+                            )
+                        except Exception as err:
+                            self._collection_errors.append(f"{channel} render: {err}")
+                            logger.debug(
+                                "Failed to render event handle on channel '%s': %s",
+                                channel,
+                                err,
+                            )
+                            render_failed = True
+                            break
+                finally:
+                    if close_handle is not None:
+                        for handle in raw_events:
+                            close_handle(handle)
 
-        # If fetched in reverse direction (initial poll), reverse list so it flows chronologically
-        if not (last_checkpoint is not None and last_checkpoint > 0):
-            xml_records.reverse()
+                errors_before_batch = len(self._collection_errors)
+                try:
+                    imported_events.extend(self.process_xml_records(channel, xml_records))
+                except Exception as err:
+                    self._collection_errors.append(f"{channel} persistence: {err}")
+                    logger.exception(
+                        "Failed to persist an event batch from channel '%s'.", channel
+                    )
+                    break
 
-        return self.process_xml_records(channel, xml_records)
+                if render_failed or len(self._collection_errors) > errors_before_batch:
+                    break
+        finally:
+            close_handle = getattr(win32evtlog, "EvtClose", None)
+            if close_handle is not None:
+                close_handle(query_handle)
+
+        return imported_events
 
     def process_xml_records(self, channel: str, xml_records: Sequence[str]) -> list[SecurityEvent]:
         """Process and normalize raw XML records, ensuring atomic persistence and checkpoint advancement.
@@ -467,15 +552,24 @@ class WindowsEventCollector:
             list[SecurityEvent]: Validated, deduplicated SecurityEvent instances.
         """
         new_events: list[SecurityEvent] = []
+        new_record_keys: list[tuple[str, int]] = []
         current_checkpoint = self.get_checkpoint(channel) or 0
         highest_persisted_id = current_checkpoint
 
         for xml_str in xml_records:
             parsed = parse_event_xml(xml_str)
             if parsed is None:
-                continue
+                self._collection_errors.append(
+                    f"{channel}: malformed event XML blocked checkpoint advancement"
+                )
+                break
 
             record_id = parsed["record_id"]
+            if record_id <= 0:
+                self._collection_errors.append(
+                    f"{channel}: invalid event record ID blocked checkpoint advancement"
+                )
+                break
             record_key = (channel, record_id)
 
             # Deduplication: check session keys and record checkpoint
@@ -487,28 +581,27 @@ class WindowsEventCollector:
             try:
                 event = normalize_event(parsed)
                 new_events.append(event)
-                self._processed_keys.add(record_key)
+                new_record_keys.append(record_key)
                 # Only advance highest_persisted_id for successfully normalized events
                 if record_id > highest_persisted_id:
                     highest_persisted_id = record_id
             except Exception as err:
                 logger.warning("Failed to normalize event record %s: %s", record_id, err)
+                self._collection_errors.append(
+                    f"{channel}: record {record_id} normalization failed"
+                )
+                break
 
         # Atomic persistence and checkpoint advancement
         if self.repository is not None:
-            if hasattr(self.repository, "save_events_with_checkpoint"):
-                self.repository.save_events_with_checkpoint(
-                    new_events,
-                    channel,
-                    highest_persisted_id if highest_persisted_id > current_checkpoint else 0,
-                )
-            else:
-                if new_events:
-                    self.repository.add_events(new_events)
-                if highest_persisted_id > current_checkpoint and self.checkpoint_repo is not None:
-                    self.checkpoint_repo.set_checkpoint(channel, highest_persisted_id)
+            self.repository.save_events_with_checkpoint(
+                new_events,
+                channel,
+                highest_persisted_id if highest_persisted_id > current_checkpoint else 0,
+            )
 
         # Update in-memory tracking only after successful persistence
+        self._processed_keys.update(new_record_keys)
         if highest_persisted_id > current_checkpoint:
             self._in_memory_checkpoints[channel] = highest_persisted_id
 

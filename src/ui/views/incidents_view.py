@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.events import EventSeverity
+from src.database.event_repository import EventRepository
+from src.core.security import redact_sensitive_data
 from src.incidents.manager import IncidentManager
 from src.incidents.models import Incident
 from src.ui.components.severity_badge import SeverityBadge, StatusBadge, make_badge_cell_widget
@@ -33,11 +35,22 @@ class IncidentsView(QWidget):
 
     incident_updated = Signal()
     open_related_event_requested = Signal(str)  # emits event_id
+    PAGE_SIZE = 100
 
-    def __init__(self, incident_manager: IncidentManager, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        incident_manager: IncidentManager,
+        parent: QWidget | None = None,
+        event_repository: EventRepository | None = None,
+    ) -> None:
         super().__init__(parent)
         self.incident_manager = incident_manager
+        self.event_repository = event_repository
         self._filtered_incidents: list[Incident] = []
+        self.page_index = 0
+        self._page_count = 1
+        self._page_incident_count = 0
+        self._total_incident_count = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -67,6 +80,18 @@ class IncidentsView(QWidget):
         controls_layout.addWidget(self.severity_filter)
 
         layout.addLayout(controls_layout)
+
+        paging_layout = QHBoxLayout()
+        self.previous_page_btn = QPushButton("Previous Page")
+        self.previous_page_btn.clicked.connect(lambda: self._set_page(self.page_index - 1))
+        paging_layout.addWidget(self.previous_page_btn)
+        self.page_label = QLabel("Page 1 of 1")
+        paging_layout.addWidget(self.page_label)
+        self.next_page_btn = QPushButton("Next Page")
+        self.next_page_btn.clicked.connect(lambda: self._set_page(self.page_index + 1))
+        paging_layout.addWidget(self.next_page_btn)
+        paging_layout.addStretch()
+        layout.addLayout(paging_layout)
 
         # 2. Main Splitter: Incident Cases Table (Left) + Case Triage Pane (Right)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -186,13 +211,32 @@ class IncidentsView(QWidget):
         """Reload incidents from manager."""
         self._apply_filters()
 
+    def _set_page(self, page_index: int) -> None:
+        if 0 <= page_index < self._page_count and page_index != self.page_index:
+            self.page_index = page_index
+            self.refresh()
+
     def _apply_filters(self) -> None:
         """Filter incidents list."""
         query = self.search_input.text().strip().lower()
         status_choice = self.status_filter.currentText().lower()
         sev_choice = self.severity_filter.currentText()
 
-        all_incidents = self.incident_manager.incidents
+        total_incidents = self.incident_manager.count_incidents()
+        self._page_count = max(
+            1,
+            (total_incidents + self.PAGE_SIZE - 1) // self.PAGE_SIZE,
+        )
+        self.page_index = min(self.page_index, self._page_count - 1)
+        all_incidents = self.incident_manager.hydrate_from_repository(
+            limit=self.PAGE_SIZE,
+            offset=self.page_index * self.PAGE_SIZE,
+        )
+        self._page_incident_count = len(all_incidents)
+        self._total_incident_count = total_incidents
+        self.page_label.setText(f"Page {self.page_index + 1} of {self._page_count}")
+        self.previous_page_btn.setEnabled(self.page_index > 0)
+        self.next_page_btn.setEnabled(self.page_index + 1 < self._page_count)
         self._filtered_incidents = []
 
         for inc in all_incidents:
@@ -225,7 +269,9 @@ class IncidentsView(QWidget):
 
         for row, inc in enumerate(self._filtered_incidents):
             time_str = inc.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            self.table.setItem(row, 0, QTableWidgetItem(time_str))
+            created_item = QTableWidgetItem(time_str)
+            created_item.setData(Qt.ItemDataRole.UserRole, inc.incident_id)
+            self.table.setItem(row, 0, created_item)
 
             badge_sev = SeverityBadge(inc.severity)
             self.table.setCellWidget(row, 1, make_badge_cell_widget(badge_sev))
@@ -238,7 +284,12 @@ class IncidentsView(QWidget):
             self.table.setItem(row, 5, QTableWidgetItem(inc.incident_id[:8] + "..."))
 
         self.table.setSortingEnabled(True)
-        self.lbl_count.setText(f"Showing {len(self._filtered_incidents):,} of {len(self.incident_manager.incidents):,} incidents")
+        self.lbl_count.setText(
+            f"Showing {len(self._filtered_incidents):,} of {self._page_incident_count:,} incidents on this page "
+            f"({self.page_index * self.PAGE_SIZE + 1 if self._page_incident_count else 0:,}-"
+            f"{self.page_index * self.PAGE_SIZE + self._page_incident_count:,} of "
+            f"{self._total_incident_count:,} total)"
+        )
         self.details_text.clear()
         self.combo_update_status.setEnabled(False)
         self.btn_apply_status.setEnabled(False)
@@ -250,10 +301,12 @@ class IncidentsView(QWidget):
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             return None
-        row_index = selected_rows[0].row()
-        if 0 <= row_index < len(self._filtered_incidents):
-            return self._filtered_incidents[row_index]
-        return None
+        item = self.table.item(selected_rows[0].row(), 0)
+        incident_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return next(
+            (incident for incident in self._filtered_incidents if incident.incident_id == incident_id),
+            None,
+        )
 
     def _on_selection_changed(self) -> None:
         inc = self._get_selected_incident()
@@ -280,6 +333,7 @@ class IncidentsView(QWidget):
         # Build formatted presentation
         details_dict = {
             "incident_id": inc.incident_id,
+            "alert_key": inc.alert_key,
             "title": inc.title,
             "status": inc.status.upper(),
             "severity": inc.severity.value,
@@ -288,9 +342,35 @@ class IncidentsView(QWidget):
             "description": inc.description,
             "rule_metadata": inc.attributes,
             "related_events": inc.related_event_ids,
+            "investigation_timeline": self._get_investigation_timeline(inc),
             "analyst_notes": inc.notes if inc.notes else ["(No notes added yet)"],
         }
-        self.details_text.setPlainText(json.dumps(details_dict, indent=2))
+        self.details_text.setPlainText(json.dumps(redact_sensitive_data(details_dict), indent=2))
+
+    def _get_investigation_timeline(self, incident: Incident) -> list[dict[str, str]]:
+        """Resolve retained evidence events into a chronological incident timeline."""
+        if self.event_repository is None:
+            return [
+                {"event_id": event_id, "status": "Timeline repository unavailable"}
+                for event_id in incident.related_event_ids
+            ]
+
+        timeline: list[dict[str, str]] = []
+        for event_id in incident.related_event_ids:
+            event = self.event_repository.get_event(event_id)
+            if event is None:
+                timeline.append({"event_id": event_id, "status": "Evidence event not retained"})
+            else:
+                timeline.append(
+                    {
+                        "event_id": event_id,
+                        "timestamp": event.timestamp.isoformat(),
+                        "event_type": event.event_type,
+                        "severity": event.severity.value,
+                        "description": event.description,
+                    }
+                )
+        return sorted(timeline, key=lambda item: item.get("timestamp", ""))
 
     def _update_status(self) -> None:
         inc = self._get_selected_incident()

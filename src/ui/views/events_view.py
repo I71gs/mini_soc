@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.events import EventSeverity, SecurityEvent
+from src.core.security import redact_sensitive_data, safe_json_dumps, spreadsheet_safe
 from src.ui.components.severity_badge import SeverityBadge, make_badge_cell_widget
 
 
@@ -32,11 +33,15 @@ class EventsView(QWidget):
     """Telemetry browser displaying collected security events with filtering, sorting, and inspector."""
 
     refresh_requested = Signal()
+    page_changed = Signal(int)
+    PAGE_SIZE = 100
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._all_events: list[SecurityEvent] = []
         self._filtered_events: list[SecurityEvent] = []
+        self.page_index = 0
+        self._page_count = 1
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -94,6 +99,18 @@ class EventsView(QWidget):
         controls_layout.addWidget(self.refresh_btn)
 
         layout.addLayout(controls_layout)
+
+        paging_layout = QHBoxLayout()
+        self.previous_page_btn = QPushButton("Previous Page")
+        self.previous_page_btn.clicked.connect(lambda: self._request_page(self.page_index - 1))
+        paging_layout.addWidget(self.previous_page_btn)
+        self.page_label = QLabel("Page 1 of 1")
+        paging_layout.addWidget(self.page_label)
+        self.next_page_btn = QPushButton("Next Page")
+        self.next_page_btn.clicked.connect(lambda: self._request_page(self.page_index + 1))
+        paging_layout.addWidget(self.next_page_btn)
+        paging_layout.addStretch()
+        layout.addLayout(paging_layout)
 
         # 2. Main Splitter: Events Table (Left) + Event Inspector Pane (Right)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -168,14 +185,37 @@ class EventsView(QWidget):
 
         layout.addWidget(splitter, 1)
 
+        self.lbl_empty_state = QLabel()
+        self.lbl_empty_state.setWordWrap(True)
+        self.lbl_empty_state.setStyleSheet("color: #facc15; padding: 4px;")
+        layout.addWidget(self.lbl_empty_state)
+
         # Status footer bar
         self.lbl_count = QLabel("Showing 0 events")
         self.lbl_count.setStyleSheet("color: #94a3b8; font-size: 11px;")
         layout.addWidget(self.lbl_count)
 
-    def set_events(self, events: Sequence[SecurityEvent]) -> None:
+    def set_events(
+        self,
+        events: Sequence[SecurityEvent],
+        total_event_count: int | None = None,
+        matching_event_count: int | None = None,
+        page_index: int = 0,
+    ) -> None:
         """Update the table with a new batch of security events."""
         self._all_events = list(events)
+        self._total_event_count = total_event_count
+        self._matching_event_count = matching_event_count
+        self.page_index = page_index
+        page_count = max(
+            1,
+            (matching_event_count + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+            if matching_event_count is not None else 1,
+        )
+        self._page_count = page_count
+        self.page_label.setText(f"Page {self.page_index + 1} of {self._page_count}")
+        self.previous_page_btn.setEnabled(self.page_index > 0)
+        self.next_page_btn.setEnabled(self.page_index + 1 < self._page_count)
 
         # Update available filter choices dynamically
         current_source = self.source_filter.currentText()
@@ -200,6 +240,10 @@ class EventsView(QWidget):
         self.category_filter.blockSignals(False)
 
         self._apply_filters()
+
+    def _request_page(self, page_index: int) -> None:
+        if 0 <= page_index < self._page_count and page_index != self.page_index:
+            self.page_changed.emit(page_index)
 
     def _apply_filters(self) -> None:
         """Filter the events list based on search text, severity, source, and category."""
@@ -226,7 +270,7 @@ class EventsView(QWidget):
             # Search text query
             if query:
                 searchable = (
-                    f"{e.description} {e.host} {e.event_type} {e.source} "
+                    f"{e.event_id} {e.description} {e.host} {e.event_type} {e.source} "
                     f"{json.dumps(e.attributes)}"
                 ).lower()
                 if query not in searchable:
@@ -244,7 +288,9 @@ class EventsView(QWidget):
 
         for row, evt in enumerate(self._filtered_events):
             time_str = evt.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-            self.table.setItem(row, 0, QTableWidgetItem(time_str))
+            timestamp_item = QTableWidgetItem(time_str)
+            timestamp_item.setData(Qt.ItemDataRole.UserRole, str(evt.event_id))
+            self.table.setItem(row, 0, timestamp_item)
 
             badge = SeverityBadge(evt.severity)
             self.table.setCellWidget(row, 1, make_badge_cell_widget(badge))
@@ -257,7 +303,43 @@ class EventsView(QWidget):
             self.table.setItem(row, 6, QTableWidgetItem(evt.description))
 
         self.table.setSortingEnabled(True)
-        self.lbl_count.setText(f"Showing {len(self._filtered_events):,} of {len(self._all_events):,} events")
+        matching_count = self._matching_event_count
+        if matching_count is None:
+            matching_count = len(self._all_events)
+        total_count = self._total_event_count
+        if total_count is None:
+            total_count = len(self._all_events)
+        first_event = self.page_index * self.PAGE_SIZE + 1 if self._all_events else 0
+        last_event = self.page_index * self.PAGE_SIZE + len(self._all_events)
+        self.lbl_count.setText(
+            f"Showing {len(self._filtered_events):,} of {len(self._all_events):,} on this page "
+            f"({first_event:,}-{last_event:,} of {matching_count:,} in timeframe; "
+            f"{total_count:,} stored)"
+        )
+        if self._filtered_events:
+            self.lbl_empty_state.clear()
+        elif total_count == 0:
+            self.lbl_empty_state.setText(
+                "No telemetry has been observed or stored yet; this does not mean there was no activity. "
+                "Process and network collectors suppress startup snapshots, may miss activity between polls, "
+                "and can be restricted by Windows permissions. Select Poll Sensors, then check Settings "
+                "for collector health and access errors."
+            )
+        elif matching_count == 0:
+            self.lbl_empty_state.setText(
+                f"No events are in the selected timeframe. {total_count:,} older stored event(s) "
+                "may be available; change the Overview timeframe to All Time. No events in this timeframe "
+                "does not establish that no activity occurred."
+            )
+        else:
+            if not self._all_events:
+                self.lbl_empty_state.setText(
+                    "No events are on this page. Use the paging controls or change the Overview timeframe."
+                )
+            else:
+                self.lbl_empty_state.setText(
+                    "No events on this page match the current search and filters. Clear filters or browse another page."
+                )
         self.details_text.clear()
         self.copy_btn.setEnabled(False)
 
@@ -269,10 +351,17 @@ class EventsView(QWidget):
             self.copy_btn.setEnabled(False)
             return
 
-        row_index = selected_rows[0].row()
-        if 0 <= row_index < len(self._filtered_events):
-            event = self._filtered_events[row_index]
-            formatted_json = json.dumps(event.model_dump(mode="json"), indent=2)
+        item = self.table.item(selected_rows[0].row(), 0)
+        event_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        event = next(
+            (candidate for candidate in self._filtered_events if str(candidate.event_id) == event_id),
+            None,
+        )
+        if event is not None:
+            formatted_json = json.dumps(
+                redact_sensitive_data(event.model_dump(mode="json")),
+                indent=2,
+            )
             self.details_text.setPlainText(formatted_json)
             self.copy_btn.setEnabled(True)
 
@@ -304,7 +393,7 @@ class EventsView(QWidget):
                     "Source", "Event Type", "Host", "Description", "Attributes (JSON)"
                 ])
                 for e in self._filtered_events:
-                    writer.writerow([
+                    writer.writerow([spreadsheet_safe(value) if isinstance(value, str) else value for value in (
                         str(e.event_id),
                         e.timestamp.isoformat(),
                         e.severity.value,
@@ -313,8 +402,8 @@ class EventsView(QWidget):
                         e.event_type,
                         e.host,
                         e.description,
-                        json.dumps(e.attributes),
-                    ])
+                        safe_json_dumps(e.attributes),
+                    )])
             QMessageBox.information(self, "Export Successful", f"Exported {len(self._filtered_events)} events to:\n{path}")
         except Exception as err:
             QMessageBox.critical(self, "Export Error", f"Failed to export CSV: {err}")
