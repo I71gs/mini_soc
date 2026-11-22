@@ -35,6 +35,60 @@ def test_detection_engine_flags_suspicious_process():
     assert any(alert.rule_name == "suspicious_process" for alert in alerts)
 
 
+def test_detection_engine_flags_explicit_keylogger_process_marker():
+    event = _make_event(
+        source="process_collector",
+        event_type="process_started",
+        attributes={
+            "name": "C:\\Users\\Public\\keylogger.exe",
+            "pid": 2468,
+            "exe": "C:\\Users\\Public\\keylogger.exe",
+            "command_line": "keylogger.exe",
+        },
+    )
+
+    alerts = [
+        alert for alert in DetectionEngine().evaluate([event])
+        if alert.rule_name == "possible_keylogger"
+    ]
+
+    assert len(alerts) == 1
+    assert alerts[0].severity == EventSeverity.MEDIUM
+    assert alerts[0].related_event_ids == [str(event.event_id)]
+    assert "explicit_keylogger_marker" in alerts[0].attributes["indicators"]
+    assert "cannot confirm keystroke capture" in alerts[0].description
+
+
+def test_detection_engine_flags_keyboard_capture_api_and_ignores_unrelated_process():
+    suspicious_event = _make_event(
+        source="process_collector",
+        event_type="process_started",
+        attributes={
+            "name": "input-helper.exe",
+            "pid": 2469,
+            "command_line": "input-helper.exe --hook SetWindowsHookEx",
+        },
+    )
+    benign_event = _make_event(
+        source="process_collector",
+        event_type="process_started",
+        attributes={
+            "name": "notepad.exe",
+            "pid": 2470,
+            "command_line": "notepad.exe C:\\Temp\\notes.txt",
+        },
+    )
+
+    alerts = [
+        alert for alert in DetectionEngine().evaluate([suspicious_event, benign_event])
+        if alert.rule_name == "possible_keylogger"
+    ]
+
+    assert len(alerts) == 1
+    assert alerts[0].related_event_ids == [str(suspicious_event.event_id)]
+    assert "setwindowshookex" in alerts[0].attributes["indicators"]
+
+
 def test_detection_engine_flags_failed_logon_spike():
     events = [
         _make_event(

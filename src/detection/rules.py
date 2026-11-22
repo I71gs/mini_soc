@@ -79,6 +79,17 @@ SUSPICIOUS_POWERSHELL_PATTERNS = (
 
 SUSPICIOUS_REMOTE_PORTS = {22, 23, 3389, 445, 4444, 4445, 4446, 8080, 8443}
 
+KEYLOGGER_CONTEXT_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9])(?:key[\s_-]?log(?:ger)?|keystroke[\s_-]?log(?:ger)?)(?![a-z0-9])"
+)
+KEY_CAPTURE_API_INDICATORS = (
+    "setwindowshookex",
+    "getasynckeystate",
+    "pynput.keyboard",
+    "keyboard.hook",
+    "keyboard.listener",
+)
+
 
 def _is_suspicious_cmd_command(command_line: str) -> bool:
     """Treat cmd.exe as suspicious only when used for obvious offensive chaining."""
@@ -198,6 +209,67 @@ class SuspiciousProcessRule(DetectionRule):
                         "exe": event.attributes.get("exe"),
                         "username": event.attributes.get("username"),
                         "command_line": event.attributes.get("command_line") or event.attributes.get("command"),
+                    },
+                )
+            )
+        return alerts
+
+
+class PossibleKeyloggerRule(DetectionRule):
+    """Flag process starts with explicit keylogger or keyboard-capture indicators."""
+
+    name = "possible_keylogger"
+    description = "Flags process metadata containing possible keylogging indicators"
+    scope = "New process starts whose names, executable paths, or command lines match keylogging indicators."
+    limitations = (
+        "Process metadata alone cannot confirm keystroke capture. Keyboard hooks and related APIs "
+        "are also used by legitimate accessibility, input, and automation software; validate the "
+        "process signature, path, parent, and host context."
+    )
+    severity = EventSeverity.MEDIUM
+    event_types = ("process_started",)
+
+    def evaluate(self, events: Sequence[SecurityEvent]) -> list[DetectionAlert]:
+        alerts: list[DetectionAlert] = []
+        for event in events:
+            if event.event_type != "process_started":
+                continue
+
+            name = str(event.attributes.get("name") or "")
+            executable = str(event.attributes.get("exe") or "")
+            command_line = str(event.attributes.get("command_line") or "")
+            process_name = name.replace("/", "\\").rsplit("\\", 1)[-1]
+            searchable_text = " ".join((name, executable, command_line)).lower()
+            indicators: list[str] = []
+
+            if KEYLOGGER_CONTEXT_PATTERN.search(searchable_text):
+                indicators.append("explicit_keylogger_marker")
+            indicators.extend(
+                indicator
+                for indicator in KEY_CAPTURE_API_INDICATORS
+                if indicator in searchable_text
+            )
+            if not indicators:
+                continue
+
+            alerts.append(
+                DetectionAlert(
+                    rule_name=self.name,
+                    title=f"Possible keylogger indicator observed: {process_name or 'unknown process'}",
+                    description=(
+                        f"Process '{process_name or 'unknown'}' started on host '{event.host}' and "
+                        f"matched keylogging indicator(s): {', '.join(indicators)}. Process metadata "
+                        "cannot confirm keystroke capture; validate the executable and host context."
+                    ),
+                    severity=self.severity,
+                    source=event.source,
+                    related_event_ids=[str(event.event_id)],
+                    attributes={
+                        "pid": event.attributes.get("pid"),
+                        "name": name,
+                        "exe": executable or None,
+                        "username": event.attributes.get("username"),
+                        "indicators": indicators,
                     },
                 )
             )
@@ -359,6 +431,7 @@ class DetectionEngine:
     def __init__(self, rules: Sequence[DetectionRule] | None = None) -> None:
         self.rules = list(rules) if rules is not None else [
             SuspiciousProcessRule(),
+            PossibleKeyloggerRule(),
             FailedLogonSpikeRule(),
             SuspiciousOutboundConnectionRule(),
         ]

@@ -530,7 +530,7 @@ The suite covers configuration, events, database, collectors, detection, reporti
 | Host Telemetry Collectors | ✅ Complete | Process and network connection collectors with deduplication and visible health |
 | Windows Event Log Collector | ✅ Complete | Security & System logs (IDs 4624, 4625, 1102, 7045), persistent checkpoints and permission errors |
 | Monitoring Orchestrator | ✅ Complete | HostMonitorService for polling with error isolation |
-| Detection Engine | ✅ Complete | 3 heuristic rules: selected suspicious process command patterns, fully attributed failed-logon spikes, and established connections using selected remote service ports |
+| Detection Engine | ✅ Complete | 4 heuristic rules: selected suspicious process command patterns, possible keylogger process indicators, fully attributed failed-logon spikes, and established connections using selected remote service ports |
 | Incident Workflow | ✅ Complete | Stable alert deduplication, status lifecycle, analyst notes, evidence timeline, SQLite persistence |
 | Reporting & Export | ✅ Complete | CSV and JSON export for events, incidents, and summaries |
 | Desktop Console (PySide6) | ✅ Complete | 5-view dashboard with dark theme, severity badges, filters, triage actions, CSV export |

@@ -263,11 +263,20 @@ def test_host_monitor_service_error_isolation() -> None:
 
 
 def test_host_monitor_service_polls_windows_events_in_background() -> None:
+    process_collector = MagicMock(spec=ProcessCollector)
+    process_collector.collect_events.return_value = []
+    process_collector.last_error = None
+    process_collector.permission_denied_count = 0
+    network_collector = MagicMock(spec=NetworkCollector)
+    network_collector.collect_events.return_value = []
+    network_collector.last_error = None
     event_log_collector = MagicMock(spec=WindowsEventCollector)
     event_log_collector.collect_events.return_value = []
     event_log_collector.health = MagicMock()
     service = HostMonitorService(
         poll_interval=0.01,
+        process_collector=process_collector,
+        network_collector=network_collector,
         windows_event_collector=event_log_collector,
     )
 
