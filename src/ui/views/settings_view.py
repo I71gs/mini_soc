@@ -70,6 +70,14 @@ class SettingsView(QWidget):
         paths_layout.addRow("SQLite Database:", make_value_lbl(str(config.database_path)))
         paths_layout.addRow("Log Directory:", make_value_lbl(str(config.log_dir)))
         paths_layout.addRow("Host System:", QLabel(f"{socket.gethostname()} ({platform.system()} {platform.release()})"))
+        self.lbl_storage_notice = QLabel(
+            f"Events older than {config.retention_days} days are removed at startup. "
+            "The database and logs are not encrypted; protect this folder with Windows ACLs. "
+            "Exports are saved separately and are not covered by database cleanup."
+        )
+        self.lbl_storage_notice.setWordWrap(True)
+        self.lbl_storage_notice.setStyleSheet("color: #facc15; font-size: 11px;")
+        paths_layout.addRow("Storage handling:", self.lbl_storage_notice)
 
         layout.addWidget(paths_box)
 
@@ -99,19 +107,26 @@ class SettingsView(QWidget):
         sensor_layout.setSpacing(8)
 
         sensors = [
-            ("Process Collector (psutil)", "Enabled", "Enumerates running processes, tracks PID + create_time"),
-            ("Network Collector (psutil)", "Enabled", "Enumerates active sockets, TCP/UDP endpoints and PIDs"),
-            ("Windows Event Collector (pywin32)", "Enabled", "Captures Security & System logs (IDs 4624, 4625, 1102, 7045)"),
-            ("Detection Engine", "Enabled", "3 built-in rules: suspicious process, failed logon spike, risky network"),
+            ("Process Collector", "Process Collector (psutil)", "Tracks new process starts and command lines"),
+            ("Network Collector", "Network Collector (psutil)", "Enumerates active sockets and associated PIDs"),
+            ("Windows Event Log", "Windows Event Collector (pywin32)", "Captures Security & System events"),
+            ("Detection Engine", "Detection Engine", "Evaluates the configured built-in rules"),
         ]
+        self.collector_status_labels: dict[str, QLabel] = {}
+        self.collector_description_labels: dict[str, QLabel] = {}
+        self.collector_descriptions: dict[str, str] = {}
 
-        for name, status, desc in sensors:
+        for key, name, desc in sensors:
             row = QHBoxLayout()
             lbl_name = QLabel(f"<b>{name}</b>")
-            lbl_status = QLabel(status.upper())
+            lbl_status = QLabel("NOT POLLED")
             lbl_status.setStyleSheet("color: #4ade80; background-color: rgba(74, 222, 128, 0.15); border: 1px solid #22c55e; border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: bold;")
+            self.collector_status_labels[key] = lbl_status
             lbl_desc = QLabel(f"— {desc}")
             lbl_desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            lbl_desc.setWordWrap(True)
+            self.collector_description_labels[key] = lbl_desc
+            self.collector_descriptions[key] = desc
 
             row.addWidget(lbl_name)
             row.addWidget(lbl_status)
@@ -122,7 +137,12 @@ class SettingsView(QWidget):
         layout.addWidget(sensor_box)
         layout.addStretch()
 
-    def update_diagnostics(self, total_events: int, checkpoints: dict[str, int]) -> None:
+    def update_diagnostics(
+        self,
+        total_events: int,
+        checkpoints: dict[str, int],
+        collector_health: dict[str, dict[str, str | int | None]] | None = None,
+    ) -> None:
         """Update live statistics."""
         self.lbl_total_records.setText(f"{total_events:,} events persisted in SQLite")
         if checkpoints:
@@ -130,3 +150,42 @@ class SettingsView(QWidget):
             self.lbl_checkpoints.setText(chk_str)
         else:
             self.lbl_checkpoints.setText("No checkpoints recorded yet")
+
+        for key, label in self.collector_status_labels.items():
+            health = (collector_health or {}).get(key)
+            status = str(health.get("status", "not polled")) if health else "not polled"
+            limitations = str(health.get("visibility_limitations") or "") if health else ""
+            label.setText(
+                f"{status.upper()} · LIMITED"
+                if status == "healthy" and limitations else status.upper()
+            )
+            if status == "healthy":
+                color = "#facc15" if limitations else "#4ade80"
+            elif status == "not polled":
+                color = "#94a3b8"
+            else:
+                color = "#facc15"
+            label.setStyleSheet(
+                f"color: {color}; border: 1px solid {color}; border-radius: 4px; "
+                "padding: 2px 8px; font-size: 10px; font-weight: bold;"
+            )
+            if health:
+                error = health.get("last_error")
+                last_success = health.get("last_success_at")
+                details = [
+                    f"Last successful collection: {last_success or 'never'}",
+                    f"Latest collection error or restriction: {error}" if error else None,
+                    f"Known visibility limitations: {limitations}" if limitations else None,
+                ]
+                label.setToolTip("\n".join(detail for detail in details if detail))
+                description = self.collector_descriptions[key]
+                if limitations:
+                    description += f"\nKnown limitations: {limitations}"
+                description += f"\nLast successful collection: {last_success or 'never'}"
+                if error:
+                    description += f"\nLatest error/restriction: {error}"
+                self.collector_description_labels[key].setText(f"— {description}")
+            else:
+                self.collector_description_labels[key].setText(
+                    f"— {self.collector_descriptions[key]}\nLast successful collection: never"
+                )

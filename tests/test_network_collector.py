@@ -11,6 +11,7 @@ import pytest
 from src.collectors.monitor_service import HostMonitorService
 from src.collectors.network_collector import NetworkCollector, NetworkConnectionInfo
 from src.collectors.process_collector import ProcessCollector, ProcessInfo
+from src.collectors.windows_event_collector import WindowsEventCollector
 from src.core.events import EventCategory, EventSeverity, SecurityEvent
 from src.database.connection import DatabaseManager
 from src.database.event_repository import EventRepository
@@ -170,6 +171,28 @@ def test_collector_error_handling() -> None:
         assert collector.get_snapshot() == []
 
 
+def test_failed_snapshot_preserves_network_baseline_and_reports_health() -> None:
+    connection = MockSConn(
+        -1,
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        MockAddr("10.0.0.5", 49152),
+        MockAddr("1.1.1.1", 443),
+        "ESTABLISHED",
+        123,
+    )
+    collector = NetworkCollector()
+    with patch("psutil.net_connections", return_value=[connection]):
+        assert len(collector.collect_events()) == 1
+
+    with patch("psutil.net_connections", side_effect=psutil.AccessDenied()):
+        assert collector.collect_events() == []
+        assert "Access denied" in collector.last_error
+
+    with patch("psutil.net_connections", return_value=[connection]):
+        assert collector.collect_events() == []
+
+
 def test_network_collector_persistence_integration(tmp_path: Path) -> None:
     """Test that generated network events are persisted into EventRepository."""
     db_file = tmp_path / "net_test.db"
@@ -212,16 +235,16 @@ def test_host_monitor_service_orchestration(tmp_path: Path) -> None:
         service = HostMonitorService(repository=repo, poll_interval=0.1)
         events = service.collect_once()
 
-    assert len(events) == 2
-    assert repo.count_events() == 2
+        assert len(events) == 2
+        assert repo.count_events() == 2
 
-    # Verify background thread start and graceful stop
-    assert not service.is_running
-    service.start()
-    assert service.is_running
-    time.sleep(0.05)
-    service.stop(timeout=1.0)
-    assert not service.is_running
+        # Verify background thread start and graceful stop without polling the real host.
+        assert not service.is_running
+        service.start()
+        assert service.is_running
+        time.sleep(0.05)
+        service.stop(timeout=1.0)
+        assert not service.is_running
 
 
 def test_host_monitor_service_error_isolation() -> None:
@@ -237,3 +260,94 @@ def test_host_monitor_service_error_isolation() -> None:
     assert len(events) == 1
     assert events[0].source == "network_collector"
     assert events[0].attributes["local_port"] == 7777
+
+
+def test_host_monitor_service_polls_windows_events_in_background() -> None:
+    event_log_collector = MagicMock(spec=WindowsEventCollector)
+    event_log_collector.collect_events.return_value = []
+    event_log_collector.health = MagicMock()
+    service = HostMonitorService(
+        poll_interval=0.01,
+        windows_event_collector=event_log_collector,
+    )
+
+    service.start()
+    deadline = time.monotonic() + 1.0
+    while event_log_collector.collect_events.call_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    service.stop(timeout=1.0)
+
+    assert event_log_collector.collect_events.call_count >= 1
+    assert not service.is_running
+
+
+def test_windows_event_log_failure_does_not_stop_host_collection() -> None:
+    process_collector = MagicMock()
+    process_collector.collect_events.return_value = []
+    process_collector.last_error = None
+    process_collector.permission_denied_count = 0
+    host_event = SecurityEvent(
+        source="network_collector",
+        category=EventCategory.NETWORK,
+        event_type="network_connection_observed",
+        description="Observed a network connection",
+    )
+    network_collector = MagicMock()
+    network_collector.collect_events.return_value = [host_event]
+    network_collector.last_error = None
+    event_log_collector = MagicMock(spec=WindowsEventCollector)
+    event_log_collector.collect_events.side_effect = RuntimeError("Event Log unavailable")
+    event_log_collector.health = MagicMock()
+    service = HostMonitorService(
+        process_collector=process_collector,
+        network_collector=network_collector,
+        windows_event_collector=event_log_collector,
+    )
+
+    events = service.collect_once()
+
+    assert events == [host_event]
+    event_log_collector.health.record.assert_called_once_with(0, "Event Log unavailable")
+
+
+def test_partial_process_metadata_is_reported_as_limited_visibility() -> None:
+    process_collector = MagicMock()
+    process_collector.collect_events.return_value = []
+    process_collector.last_error = None
+    process_collector.permission_denied_count = 3
+    network_collector = MagicMock()
+    network_collector.collect_events.return_value = []
+    network_collector.last_error = None
+    service = HostMonitorService(
+        process_collector=process_collector,
+        network_collector=network_collector,
+    )
+
+    service.collect_once()
+
+    process_health = service.health["Process Collector"]
+    assert process_health.status == "healthy"
+    assert process_health.last_error is None
+    assert process_health.last_success_at is not None
+    assert any("3 process records" in item for item in process_health.visibility_limitations)
+
+
+def test_host_monitor_reports_standard_user_access_restrictions() -> None:
+    with patch("psutil.process_iter", side_effect=psutil.AccessDenied(pid=4)), patch(
+        "psutil.net_connections", side_effect=psutil.AccessDenied()
+    ):
+        service = HostMonitorService()
+        service.initialize_baselines()
+        service.collect_once()
+
+    process_health = service.health["Process Collector"]
+    network_health = service.health["Network Collector"]
+    assert process_health.status == "degraded"
+    assert process_health.last_error
+    assert process_health.last_success_at is None
+    assert any("active at startup" in text for text in process_health.visibility_limitations)
+    assert network_health.status == "degraded"
+    assert "Access denied" in (network_health.last_error or "")
+    assert network_health.last_success_at is None
+    assert any("active at startup" in text for text in network_health.visibility_limitations)

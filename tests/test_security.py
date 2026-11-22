@@ -1,5 +1,12 @@
+import pytest
+
 from src.core.config import AppConfig
-from src.core.security import redact_sensitive_data, safe_json_dumps, validate_safe_relative_path
+from src.core.security import (
+    redact_sensitive_data,
+    safe_json_dumps,
+    spreadsheet_safe,
+    validate_safe_relative_path,
+)
 
 
 def test_redact_sensitive_data_removes_secrets():
@@ -27,6 +34,11 @@ def test_safe_json_dumps_redacts_sensitive_content():
     assert "secret" not in output
 
 
+def test_spreadsheet_safe_escapes_formula_like_text():
+    assert spreadsheet_safe("=HYPERLINK(\"https://example.invalid\")").startswith("'=")
+    assert spreadsheet_safe(" analyst") == " analyst"
+
+
 def test_validate_safe_relative_path_rejects_traversal():
     try:
         validate_safe_relative_path("../outside")
@@ -35,10 +47,12 @@ def test_validate_safe_relative_path_rejects_traversal():
         pass
 
 
-def test_app_config_rejects_escape_from_project_root(tmp_path):
+def test_app_config_allows_explicit_absolute_storage_outside_project_root(tmp_path):
     outside = tmp_path / "outside"
-    try:
-        AppConfig(data_dir=outside)
-        raise AssertionError("Expected ValueError for escaping project root")
-    except ValueError:
-        pass
+    config = AppConfig(project_root=tmp_path / "project", data_dir=outside, auto_create_dirs=False)
+    assert config.data_dir == outside.resolve()
+
+
+def test_app_config_rejects_relative_storage_traversal(tmp_path):
+    with pytest.raises(ValueError):
+        AppConfig(project_root=tmp_path / "project", data_dir="../outside", auto_create_dirs=False)

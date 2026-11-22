@@ -1,7 +1,7 @@
 """Rule-based detection engine for Mini SOC.
 
-Provides a small set of built-in security detections for suspicious process start,
-repeated failed logons, and high-risk outbound network connections.
+Provides built-in heuristics for selected process starts, attributed failed-logon
+spikes, and established connections using selected remote service ports.
 """
 
 from __future__ import annotations
@@ -9,7 +9,9 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import ipaddress
 from typing import Any, Sequence
 
 from src.core.events import EventSeverity, SecurityEvent
@@ -42,6 +44,18 @@ SUSPICIOUS_CMD_PATTERNS = (
     "start /b",
     "mshta",
 )
+
+SUSPICIOUS_LOLBIN_PATTERNS = {
+    "rundll32.exe": ("javascript:", "comsvcs.dll,minidump", "http://", "https://"),
+    "regsvr32.exe": ("scrobj.dll", "/i:http", "/i:https"),
+    "wmic.exe": ("process call create", "/node:"),
+    "mshta.exe": ("javascript:", "vbscript:", "http://", "https://"),
+    "certutil.exe": ("-urlcache", "-decode", "-encode", "-verifyctl"),
+    "bitsadmin.exe": ("/transfer", "/addfile", "/setnotifycmdline"),
+    "netsh.exe": ("portproxy", "add helper", "firewall add"),
+    "bcdedit.exe": ("testsigning on", "nointegritychecks on", "debug on"),
+    "psexec.exe": ("\\\\", "-s "),
+}
 
 SUSPICIOUS_POWERSHELL_PATTERNS = (
     "-enc",
@@ -102,6 +116,14 @@ class DetectionAlert:
     related_event_ids: list[str] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    alert_key: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.alert_key:
+            identity = "|".join(
+                (self.rule_name, self.source, *sorted(self.related_event_ids))
+            )
+            object.__setattr__(self, "alert_key", sha256(identity.encode("utf-8")).hexdigest())
 
 
 class DetectionRule:
@@ -110,6 +132,8 @@ class DetectionRule:
     name: str = "base_rule"
     description: str = "Base detection rule"
     severity: EventSeverity = EventSeverity.MEDIUM
+    event_types: tuple[str, ...] = ()
+    requires_complete_event_set = False
 
     def evaluate(self, events: Sequence[SecurityEvent]) -> list[DetectionAlert]:
         """Return zero or more alerts for the given event sequence."""
@@ -117,11 +141,17 @@ class DetectionRule:
 
 
 class SuspiciousProcessRule(DetectionRule):
-    """Flag known suspicious process names seen during startup."""
+    """Flag selected process command patterns that warrant analyst review."""
 
     name = "suspicious_process"
-    description = "Detects process starts matching known admin/abuse tool names"
+    description = "Flags selected process and command-line patterns for review"
+    scope = "Newly observed process starts matching configured tool and command-line indicators."
+    limitations = (
+        "Administrative and dual-use tools can be legitimate; names and command-line patterns "
+        "are heuristics and do not establish malicious intent."
+    )
     severity = EventSeverity.HIGH
+    event_types = ("process_started",)
 
     def evaluate(self, events: Sequence[SecurityEvent]) -> list[DetectionAlert]:
         alerts: list[DetectionAlert] = []
@@ -130,6 +160,7 @@ class SuspiciousProcessRule(DetectionRule):
                 continue
 
             process_name = str(event.attributes.get("name", "")).lower()
+            process_name = process_name.rsplit("\\", 1)[-1]
             command_line = str(
                 event.attributes.get("command_line")
                 or event.attributes.get("command")
@@ -143,7 +174,11 @@ class SuspiciousProcessRule(DetectionRule):
             elif process_name in {"powershell.exe", "powershell_ise.exe"}:
                 if not _is_suspicious_powershell_command(command_line):
                     continue
-            elif process_name not in SUSPICIOUS_PROCESS_NAMES:
+            elif process_name in SUSPICIOUS_PROCESS_NAMES:
+                patterns = SUSPICIOUS_LOLBIN_PATTERNS.get(process_name, ())
+                if not command_line or not any(pattern in command_line for pattern in patterns):
+                    continue
+            else:
                 continue
 
             alerts.append(
@@ -151,8 +186,9 @@ class SuspiciousProcessRule(DetectionRule):
                     rule_name=self.name,
                     title=f"Suspicious process observed: {process_name}",
                     description=(
-                        f"Process '{process_name}' was started on host '{event.host}' and may be "
-                        "used for defense evasion or administrative abuse."
+                        f"Process '{process_name}' started on host '{event.host}' and matched a "
+                        "configured suspicious command-line indicator. This dual-use tool may be "
+                        "legitimate; validate the user, parent process, command line, and host context."
                     ),
                     severity=self.severity,
                     source=event.source,
@@ -169,55 +205,99 @@ class SuspiciousProcessRule(DetectionRule):
 
 
 class FailedLogonSpikeRule(DetectionRule):
-    """Flag repeated failed authentications as a possible brute-force pattern."""
+    """Flag repeated failed authentications with complete attribution."""
 
     name = "failed_logon_spike"
-    description = "Raises alerts when multiple failed logons occur in a short period"
+    description = "Flags three or more fully attributed failed logons within ten minutes"
+    scope = "Groups failures by host, account, and valid source IP within a ten-minute window."
+    limitations = (
+        "Events missing a host, account, or valid source IP are excluded from correlation. "
+        "A spike can result from user error, stale credentials, or automated clients and is not "
+        "proof of brute force or compromise."
+    )
     severity = EventSeverity.HIGH
+    window = timedelta(minutes=10)
+    threshold = 3
+    event_types = ("windows_logon_failed",)
+    requires_complete_event_set = True
 
     def evaluate(self, events: Sequence[SecurityEvent]) -> list[DetectionAlert]:
+        cutoff = datetime.now(timezone.utc) - self.window
         failed_events = [
-            event for event in events if event.event_type == "windows_logon_failed"
+            event for event in events
+            if event.event_type == "windows_logon_failed" and event.timestamp >= cutoff
         ]
-        if len(failed_events) < 3:
+        if len(failed_events) < self.threshold:
             return []
 
-        grouped: dict[str, list[SecurityEvent]] = defaultdict(list)
+        grouped: dict[tuple[str, str, str], list[SecurityEvent]] = defaultdict(list)
         for event in failed_events:
-            account = str(event.attributes.get("account_name") or "unknown")
-            grouped[account].append(event)
+            account_value = event.attributes.get("account_name")
+            source_value = event.attributes.get("source_ip")
+            account = str(account_value).strip() if account_value is not None else ""
+            host = str(event.host).strip() if event.host is not None else ""
+            source = str(source_value).strip() if source_value is not None else ""
+            unknown_values = {"", "-", "unknown", "<unknown>", "none", "null", "n/a", "not available"}
+            if (
+                account.casefold() in unknown_values
+                or host.casefold() in unknown_values
+                or source.casefold() in unknown_values
+            ):
+                continue
+            try:
+                source_ip = str(ipaddress.ip_address(source))
+            except ValueError:
+                continue
+            grouped[(account.casefold(), host.casefold(), source_ip)].append(event)
 
         alerts: list[DetectionAlert] = []
-        for account, account_events in grouped.items():
-            if len(account_events) < 3:
+        for (account_key, host_key, source_ip), account_events in grouped.items():
+            if len(account_events) < self.threshold:
                 continue
             related_ids = [str(event.event_id) for event in account_events]
+            first_event = min(account_events, key=lambda event: event.timestamp)
+            account = str(account_events[0].attributes["account_name"]).strip()
+            host = str(account_events[0].host).strip()
+            identity = f"{self.name}|{host_key}|{account_key}|{source_ip}|{first_event.event_id}"
             alerts.append(
                 DetectionAlert(
                     rule_name=self.name,
-                    title=f"Failed logon spike for account '{account}'",
+                    title=f"Failed logon spike for '{account}' (attributed)",
                     description=(
-                        f"{len(account_events)} failed Windows logons were observed for account '{account}' "
-                        "within the current observation period, which may indicate an attack or brute-force pattern."
+                        f"{len(account_events)} failed Windows logons with known account and source IP "
+                        f"were observed for '{account}' from {source_ip} on host '{host}' within 10 minutes. "
+                        "This may reflect user error or an automated client; verify the source and "
+                        "authentication context. Failures with missing attribution are not included."
                     ),
                     severity=self.severity,
                     source="windows_event_log",
                     related_event_ids=related_ids,
                     attributes={
                         "account_name": account,
+                        "host": host,
+                        "source_ip": source_ip,
                         "failed_count": len(account_events),
+                        "window_minutes": 10,
                     },
+                    detected_at=max(event.timestamp for event in account_events),
+                    alert_key=sha256(identity.encode("utf-8")).hexdigest(),
                 )
             )
         return alerts
 
 
 class SuspiciousOutboundConnectionRule(DetectionRule):
-    """Flag high-risk outbound connectivity to known service ports."""
+    """Flag established connections whose remote endpoint uses selected service ports."""
 
     name = "suspicious_network"
-    description = "Detects outbound connections to risky external service ports"
+    description = "Flags established connections to global remote endpoints on selected service ports"
+    scope = "Established observed connections with a global remote IP and a configured remote port."
+    limitations = (
+        "The event does not establish traffic direction or which endpoint initiated the connection. "
+        "Common service ports are frequently benign; a port match alone is not evidence of maliciousness."
+    )
     severity = EventSeverity.MEDIUM
+    event_types = ("network_connection_observed",)
 
     def evaluate(self, events: Sequence[SecurityEvent]) -> list[DetectionAlert]:
         alerts: list[DetectionAlert] = []
@@ -238,16 +318,27 @@ class SuspiciousOutboundConnectionRule(DetectionRule):
             if port_value not in SUSPICIOUS_REMOTE_PORTS:
                 continue
 
-            if remote_ip.startswith(("127.", "0.0.0.0", "10.", "192.168.", "172.")):
+            try:
+                address = ipaddress.ip_address(str(remote_ip))
+            except ValueError:
+                continue
+
+            if not address.is_global:
+                continue
+
+            if event.attributes.get("status") != "ESTABLISHED":
                 continue
 
             alerts.append(
                 DetectionAlert(
                     rule_name=self.name,
-                    title=f"Outbound connection to risky port {port_value}",
+                    title=f"Established connection observed on service port {port_value}",
                     description=(
-                        f"A network connection was observed to {remote_ip}:{port_value} on host '{event.host}'. "
-                        "This profile can be consistent with remote administration or command-and-control traffic."
+                        f"An established connection with remote endpoint {remote_ip}:{port_value} was "
+                        f"observed on host '{event.host}'. Direction and initiating endpoint are unknown. "
+                        "The port is commonly used by legitimate services and is not evidence of "
+                        "maliciousness by itself; validate the owning process, destination, and expected "
+                        "host behavior before treating this as suspicious."
                     ),
                     severity=self.severity,
                     source=event.source,

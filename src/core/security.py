@@ -51,6 +51,13 @@ def safe_json_dumps(value: Any) -> str:
         return json.dumps(redact_sensitive_data(str(value)), default=str, sort_keys=True)
 
 
+def spreadsheet_safe(value: str) -> str:
+    """Prevent untrusted CSV text from being interpreted as a spreadsheet formula."""
+    if value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
+
+
 def validate_safe_relative_path(path: str | Any) -> str:
     """Reject unsafe path values that attempt to escape the configured project root."""
     if not isinstance(path, str):

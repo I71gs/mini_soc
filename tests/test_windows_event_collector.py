@@ -1,5 +1,6 @@
 """Automated unit tests for WindowsEventCollector."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -142,6 +143,7 @@ def test_event_id_mappings_and_normalization() -> None:
     assert "bad_actor" in e4625.description
     assert e4625.attributes["status"] == "0xC000006D"
     assert e4625.attributes["source_ip"] == "192.168.1.100"
+    assert e4625.attributes["attribution_status"] == "complete"
 
     # 1102 - Security audit log cleared
     e1102 = normalize_event(parse_event_xml(SAMPLE_1102_XML))  # type: ignore[arg-type]
@@ -159,6 +161,32 @@ def test_event_id_mappings_and_normalization() -> None:
     assert "TestBackdoorService" in e7045.description
     assert e7045.attributes["service_name"] == "TestBackdoorService"
     assert e7045.attributes["image_path"] == "C:\\Windows\\Temp\\backdoor.exe"
+
+
+def test_failed_logon_with_missing_source_is_marked_incomplete() -> None:
+    xml = SAMPLE_4625_XML.replace(
+        "<Data Name='TargetUserName'>bad_actor</Data>",
+        "<Data Name='TargetUserName'>unknown</Data>",
+    ).replace(
+        "<Data Name='IpAddress'>192.168.1.100</Data>",
+        "<Data Name='IpAddress'>-</Data>",
+    )
+
+    event = normalize_event(parse_event_xml(xml))  # type: ignore[arg-type]
+
+    assert event.attributes["account_name"] == "unknown"
+    assert event.attributes["source_ip"] == "-"
+    assert event.attributes["attribution_status"] == "incomplete"
+
+
+def _service_event_xml(record_id: int) -> str:
+    timestamp = datetime.now(timezone.utc)
+    timestamp_text = timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return (
+        SAMPLE_7045_XML
+        .replace("<EventRecordID>50001</EventRecordID>", f"<EventRecordID>{record_id}</EventRecordID>")
+        .replace("2026-11-07T08:15:00.2500000Z", timestamp_text)
+    )
 
 
 def test_utc_timestamp_conversion() -> None:
@@ -267,7 +295,7 @@ def test_event_repository_persistence(tmp_path: Path) -> None:
 
     with patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
          patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=123), \
-         patch("src.collectors.windows_event_collector.win32evtlog.EvtNext", return_value=[456]), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtNext", side_effect=[[456], []]), \
          patch("src.collectors.windows_event_collector.win32evtlog.EvtRender", return_value=SAMPLE_7045_XML):
         events = collector.collect_events()
 
@@ -331,9 +359,15 @@ def test_atomic_transaction_rollback_preserves_checkpoint_and_events(tmp_path: P
     # 3. In-memory checkpoint did not advance
     assert collector.get_checkpoint("Security") == 5000
 
+    # A failed transaction must leave the record eligible for a later successful retry.
+    events = collector.process_xml_records("Security", [SAMPLE_4624_XML])
+    assert len(events) == 1
+    assert repo.count_events() == 2
+    assert checkpoint_repo.get_checkpoint("Security") == 10001
+
 
 def test_malformed_event_does_not_skip_subsequent_valid_events(tmp_path: Path) -> None:
-    """Test that encountering a malformed XML record does not interrupt subsequent valid records."""
+    """Malformed records stop checkpointing so later records can be retried safely."""
     db_file = tmp_path / "malformed_resilience.db"
     manager = DatabaseManager(db_path=db_file)
     initialize_database(manager)
@@ -350,12 +384,17 @@ def test_malformed_event_does_not_skip_subsequent_valid_events(tmp_path: Path) -
 
     events = collector.process_xml_records("Security", records)
 
-    # Both valid events must be successfully extracted and persisted
-    assert len(events) == 2
+    # Do not advance beyond the malformed record because its record ID is unknown.
+    assert len(events) == 1
     assert events[0].attributes["record_id"] == 10001
-    assert events[1].attributes["record_id"] == 10002
+    assert repo.count_events() == 1
+    assert checkpoint_repo.get_checkpoint("Security") == 10001
+
+    # Retrying from the last committed checkpoint can ingest the later valid record.
+    retry_events = collector.process_xml_records("Security", [SAMPLE_4625_XML])
+    assert len(retry_events) == 1
+    assert retry_events[0].attributes["record_id"] == 10002
     assert repo.count_events() == 2
-    # Checkpoint must advance to the highest valid record (10002)
     assert checkpoint_repo.get_checkpoint("Security") == 10002
 
 
@@ -390,10 +429,135 @@ def test_event_log_rollover_reset_handling() -> None:
     with patch.object(collector, "_is_channel_reset", return_value=True), \
          patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
          patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=999), \
-         patch("src.collectors.windows_event_collector.win32evtlog.EvtNext", return_value=[123]), \
+    patch("src.collectors.windows_event_collector.win32evtlog.EvtNext", side_effect=[[123], []]), \
          patch("src.collectors.windows_event_collector.win32evtlog.EvtRender", return_value=SAMPLE_7045_XML):
         events = collector._collect_channel("System", [7045])
 
     # Rollover was detected, checkpoint reset, and records collected
     assert len(events) == 1
     assert events[0].attributes["record_id"] == 50001
+
+
+def test_initial_backfill_reads_more_than_one_batch_without_gaps(tmp_path: Path) -> None:
+    db_file = tmp_path / "multi_batch_test.db"
+    manager = DatabaseManager(db_path=db_file)
+    initialize_database(manager)
+    repo = EventRepository(manager)
+    checkpoint_repo = CheckpointRepository(manager)
+    batch_size = 37
+    record_ids = list(range(200001, 200238))
+    batches = [
+        record_ids[index:index + batch_size]
+        for index in range(0, len(record_ids), batch_size)
+    ]
+    collector = WindowsEventCollector(
+        repository=repo,
+        checkpoint_repo=checkpoint_repo,
+        channels={"System": [7045]},
+        max_records_per_channel=batch_size,
+        initial_backfill_days=7,
+    )
+
+    with patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=999) as query, \
+         patch(
+             "src.collectors.windows_event_collector.win32evtlog.EvtNext",
+             side_effect=[*batches, []],
+         ) as next_batch, \
+         patch(
+             "src.collectors.windows_event_collector.win32evtlog.EvtRender",
+             side_effect=lambda handle, _format: _service_event_xml(handle),
+         ):
+        events = collector.collect_events()
+
+    assert len(events) == len(record_ids)
+    stored_ids = {
+        event.attributes["record_id"]
+        for event in repo.list_events(limit=len(record_ids))
+    }
+    assert stored_ids == set(record_ids)
+    assert repo.count_events() == len(record_ids)
+    assert checkpoint_repo.get_checkpoint("System") == record_ids[-1]
+    assert next_batch.call_count == len(batches) + 1
+
+    query_args = query.call_args.args
+    assert query_args[1] & collector_flag("EvtQueryForwardDirection")
+    assert "TimeCreated[@SystemTime >= '" in query_args[2]
+    assert "EventRecordID >" not in query_args[2]
+
+    with patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
+         patch.object(collector, "_is_channel_reset", return_value=False), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=1000), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtNext", return_value=[]):
+        assert collector.collect_events() == []
+    assert repo.count_events() == len(record_ids)
+
+
+def collector_flag(flag_name: str) -> int:
+    from src.collectors import windows_event_collector
+
+    return getattr(windows_event_collector.win32evtlog, flag_name)
+
+
+def test_failed_batch_can_be_retried_from_last_committed_checkpoint(tmp_path: Path) -> None:
+    db_file = tmp_path / "retry_batch_test.db"
+    manager = DatabaseManager(db_path=db_file)
+    initialize_database(manager)
+    repo = EventRepository(manager)
+    checkpoint_repo = CheckpointRepository(manager)
+    collector = WindowsEventCollector(
+        repository=repo,
+        checkpoint_repo=checkpoint_repo,
+        channels={"System": [7045]},
+        max_records_per_channel=2,
+    )
+    first_batch = [300001, 300002]
+    second_batch = [300003, 300004]
+    render = lambda handle, _format: _service_event_xml(handle)
+
+    with patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=999), \
+         patch(
+             "src.collectors.windows_event_collector.win32evtlog.EvtNext",
+             side_effect=[first_batch, RuntimeError("simulated read failure")],
+         ), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtRender", side_effect=render):
+        first_events = collector.collect_events()
+
+    assert [event.attributes["record_id"] for event in first_events] == first_batch
+    assert checkpoint_repo.get_checkpoint("System") == first_batch[-1]
+    assert repo.count_events() == len(first_batch)
+    assert collector.health.status == "degraded"
+
+    retry_collector = WindowsEventCollector(
+        repository=repo,
+        checkpoint_repo=checkpoint_repo,
+        channels={"System": [7045]},
+        max_records_per_channel=2,
+    )
+    with patch("src.collectors.windows_event_collector.HAS_WIN32EVTLOG", True), \
+         patch.object(retry_collector, "_is_channel_reset", return_value=False), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtQuery", return_value=1000), \
+         patch(
+             "src.collectors.windows_event_collector.win32evtlog.EvtNext",
+             side_effect=[second_batch, []],
+         ), \
+         patch("src.collectors.windows_event_collector.win32evtlog.EvtRender", side_effect=render):
+        retry_events = retry_collector.collect_events()
+
+    assert [event.attributes["record_id"] for event in retry_events] == second_batch
+    assert checkpoint_repo.get_checkpoint("System") == second_batch[-1]
+    assert repo.count_events() == 4
+
+
+def test_checkpoint_is_not_persisted_without_event_repository(tmp_path: Path) -> None:
+    manager = DatabaseManager(db_path=tmp_path / "checkpoint_without_events.db")
+    initialize_database(manager)
+    checkpoint_repo = CheckpointRepository(manager)
+    collector = WindowsEventCollector(checkpoint_repo=checkpoint_repo)
+
+    events = collector.process_xml_records("Security", [SAMPLE_4624_XML])
+
+    assert len(events) == 1
+    assert checkpoint_repo.get_checkpoint("Security") is None
+    assert collector.get_checkpoint("Security") == 10001

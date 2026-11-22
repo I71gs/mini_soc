@@ -4,7 +4,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from src.core.config import AppConfig
-from src.database.connection import DatabaseManager
+from src.database.connection import DatabaseManager, migrate_legacy_database
 from src.database.schema import initialize_database
 from src.ui.main_window import MainWindow
 
@@ -12,6 +12,7 @@ from src.ui.main_window import MainWindow
 def run_app() -> int:
     """Initialize database and start the Mini SOC PySide6 desktop interface."""
     config = AppConfig()
+    migrate_legacy_database(config.legacy_database_path, config.database_path)
     db_manager = DatabaseManager(config.database_path)
     initialize_database(db_manager)
 
@@ -21,6 +22,7 @@ def run_app() -> int:
 
     window = MainWindow(config=config, db_manager=db_manager)
     window.show()
+    window.start_monitoring()
 
     return app.exec()
 

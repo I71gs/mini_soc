@@ -166,6 +166,7 @@ class EventRepository:
         source: str | None = None,
         event_type: str | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[SecurityEvent]:
         """Retrieve events with optional filters ordered newest first.
 
@@ -179,6 +180,7 @@ class EventRepository:
             source: Optional source identifier filter.
             event_type: Optional event type filter.
             limit: Optional maximum number of events to return. Must be non-negative.
+            offset: Number of matching events to skip for database-backed paging.
 
         Returns:
             list[SecurityEvent]: Retrieved events matching the filter criteria.
@@ -188,6 +190,8 @@ class EventRepository:
         """
         if limit is not None and limit < 0:
             raise ValueError(f"limit must be non-negative, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
 
         conditions: list[str] = []
         params: list[Any] = []
@@ -224,6 +228,11 @@ class EventRepository:
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
+        elif offset:
+            query += " LIMIT -1"
+        if offset:
+            query += " OFFSET ?"
+            params.append(offset)
 
         with self.db_manager.get_connection() as conn:
             cursor = conn.cursor()
@@ -286,3 +295,13 @@ class EventRepository:
             cursor.execute(query, params)
             row = cursor.fetchone()
             return int(row[0]) if row and row[0] is not None else 0
+
+    def delete_events_before(self, cutoff: datetime) -> int:
+        """Delete telemetry older than a timezone-aware UTC retention cutoff."""
+        normalized_cutoff = _normalize_filter_timestamp(cutoff, "cutoff")
+        with self.db_manager.get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM security_events WHERE timestamp < ?;",
+                (normalized_cutoff,),
+            )
+            return cursor.rowcount

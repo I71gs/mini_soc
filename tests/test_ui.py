@@ -239,7 +239,8 @@ class TestOverviewView:
         )
         assert view.card_events.value_label.text() == "0"
         assert view.activity_table.rowCount() == 0
-        assert view.card_health.value_label.text() == "Normal"
+        assert view.card_health.value_label.text() == "Not Observed"
+        assert "does not establish that no activity occurred" in view.card_health.subtitle_label.text()
 
 
 class TestEventsView:
@@ -282,6 +283,22 @@ class TestEventsView:
         view.set_events(sample_events)
         view.search_input.setText("python.exe")
         assert view.table.rowCount() == 1
+
+    def test_events_view_searches_by_event_id_and_reports_stale_data(
+        self, qapp: QApplication, sample_events: list[SecurityEvent]
+    ) -> None:
+        from src.ui.views.events_view import EventsView
+
+        view = EventsView()
+        view.set_events([], total_event_count=3, matching_event_count=0)
+        assert "selected timeframe" in view.lbl_empty_state.text()
+        assert "does not establish that no activity occurred" in view.lbl_empty_state.text()
+
+        view.set_events(sample_events)
+        view.search_input.setText(str(sample_events[1].event_id))
+        assert view.table.rowCount() == 1
+        view.table.selectRow(0)
+        assert str(sample_events[1].event_id) in view.details_text.toPlainText()
 
     def test_events_view_filter_by_source(
         self, qapp: QApplication, sample_events: list[SecurityEvent]
@@ -331,6 +348,20 @@ class TestDetectionsView:
         view = DetectionsView()
         view.set_alerts(sample_alerts)
         assert view.table.rowCount() == len(sample_alerts)
+
+    def test_detections_view_explains_empty_context_and_uses_stable_review_key(
+        self, qapp: QApplication, sample_alerts: list[DetectionAlert]
+    ) -> None:
+        from src.ui.views.detections_view import DetectionsView
+
+        view = DetectionsView()
+        view.set_alerts([], empty_context="No recent events.")
+        assert view.lbl_empty_state.text() == "No recent events."
+        view.set_alerts(sample_alerts)
+        view.table.selectRow(0)
+        alert = view._get_selected_alert()
+        assert alert is not None
+        assert alert.alert_key == sample_alerts[0].alert_key
 
     def test_detections_view_filter_severity(
         self, qapp: QApplication, sample_alerts: list[DetectionAlert]
@@ -402,6 +433,99 @@ class TestIncidentsView:
         view = IncidentsView(manager)
         view.refresh()
         assert view.table.rowCount() == 2
+
+    def test_incident_inspector_includes_supporting_event_timeline(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.views.incidents_view import IncidentsView
+
+        event_repository = EventRepository(tmp_db)
+        event = SecurityEvent(
+            source="test",
+            category=EventCategory.SYSTEM,
+            event_type="test_evidence",
+            description="Supporting evidence event",
+        )
+        event_repository.add_event(event)
+        manager = IncidentManager()
+        manager.create_from_alert(
+            DetectionAlert(
+                rule_name="test_rule",
+                title="Test incident",
+                description="Investigation",
+                severity=EventSeverity.HIGH,
+                source="test",
+                related_event_ids=[str(event.event_id), str(uuid4())],
+            )
+        )
+        view = IncidentsView(manager, event_repository=event_repository)
+        view.refresh()
+        view.table.selectRow(0)
+
+        details = view.details_text.toPlainText()
+        assert "Supporting evidence event" in details
+        assert "Evidence event not retained" in details
+
+    def test_incident_view_pages_beyond_first_hundred(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.database.incident_repository import IncidentRepository
+        from src.ui.views.incidents_view import IncidentsView
+
+        repository = IncidentRepository(tmp_db)
+        manager = IncidentManager(repository)
+        repository.add_incidents([
+            Incident(
+                incident_id=f"paged-incident-{index:04}",
+                title=f"Paged incident {index}",
+                description="Pagination test",
+                severity=EventSeverity.LOW,
+                alert_key=f"paged-alert-{index:04}",
+            )
+            for index in range(525)
+        ])
+        view = IncidentsView(manager)
+        view.refresh()
+
+        assert view.table.rowCount() == view.PAGE_SIZE
+        assert view.page_label.text() == "Page 1 of 6"
+        for _ in range(5):
+            view.next_page_btn.click()
+        assert view.page_index == 5
+        assert view.table.rowCount() == 25
+        assert view.page_label.text() == "Page 6 of 6"
+
+    def test_event_view_pages_beyond_first_five_hundred(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.main_window import MainWindow
+
+        window = MainWindow(config=AppConfig(), db_manager=tmp_db)
+        now = datetime.now(timezone.utc)
+        window.event_repo.add_events([
+            SecurityEvent(
+                timestamp=now - timedelta(seconds=index),
+                source="paging_test",
+                category=EventCategory.SYSTEM,
+                event_type="ordinary_event",
+                description=f"Page record {index}",
+            )
+            for index in range(525)
+        ])
+
+        window.refresh_all_data(run_collectors=False)
+
+        assert len(window._cached_events) == window.events_view.PAGE_SIZE
+        assert window.events_view.page_label.text() == "Page 1 of 6"
+        for _ in range(5):
+            window.events_view.next_page_btn.click()
+
+        assert window.events_view.page_index == 5
+        assert len(window._cached_events) == 25
+        assert window.events_view.page_label.text() == "Page 6 of 6"
+        assert "525 in timeframe" in window.events_view.lbl_count.text()
+        assert window._cached_events[0].description == "Page record 500"
+        assert window._cached_events[-1].description == "Page record 524"
 
     def test_incidents_view_filter_status(
         self, qapp: QApplication, sample_alerts: list[DetectionAlert]
@@ -478,9 +602,12 @@ class TestSettingsView:
     def test_settings_view_instantiation(self, qapp: QApplication) -> None:
         from src.ui.views.settings_view import SettingsView
 
-        config = AppConfig()
+        config = AppConfig(retention_days=45)
         view = SettingsView(config)
         assert view is not None
+        assert "older than 45 days" in view.lbl_storage_notice.text()
+        assert "not encrypted" in view.lbl_storage_notice.text()
+        assert "not covered by database cleanup" in view.lbl_storage_notice.text()
 
     def test_settings_view_update_diagnostics(self, qapp: QApplication) -> None:
         from src.ui.views.settings_view import SettingsView
@@ -490,6 +617,49 @@ class TestSettingsView:
         view.update_diagnostics(total_events=123, checkpoints={"Security": 5000, "System": 3000})
         assert "123" in view.lbl_total_records.text()
         assert "Security" in view.lbl_checkpoints.text()
+
+    def test_settings_view_discloses_limited_visibility_and_collection_error(
+        self, qapp: QApplication
+    ) -> None:
+        from src.ui.views.settings_view import SettingsView
+
+        view = SettingsView(AppConfig())
+        view.update_diagnostics(
+            total_events=0,
+            checkpoints={},
+            collector_health={
+                "Process Collector": {
+                    "status": "degraded",
+                    "last_success_at": None,
+                    "last_error": "Access denied to protected process",
+                    "visibility_limitations": "Existing processes are baselined, not emitted.",
+                },
+            },
+        )
+
+        status = view.collector_status_labels["Process Collector"]
+        details = view.collector_description_labels["Process Collector"].text()
+        assert status.text() == "DEGRADED"
+        assert "Last successful collection: never" in details
+        assert "Access denied to protected process" in details
+        assert "baselined, not emitted" in details
+
+        view.update_diagnostics(
+            total_events=1,
+            checkpoints={},
+            collector_health={
+                "Process Collector": {
+                    "status": "healthy",
+                    "last_success_at": "2026-11-22T02:00:00+00:00",
+                    "last_error": None,
+                    "visibility_limitations": "Existing processes are baselined, not emitted.",
+                },
+            },
+        )
+        assert status.text() == "HEALTHY · LIMITED"
+        assert "Last successful collection: 2026-11-22T02:00:00+00:00" in (
+            view.collector_description_labels["Process Collector"].text()
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -545,6 +715,85 @@ class TestMainWindow:
         # Refresh without collectors should not crash
         window.refresh_all_data(run_collectors=False)
         assert window.lbl_header_sync.text().startswith("Last Sync:")
+        assert window.status_text.text() in {
+            "HOST SENSORS ACTIVE", "SENSORS DEGRADED", "SENSORS NOT POLLED"
+        }
+
+    def test_main_window_pages_events_and_detects_evidence_outside_visible_page(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.main_window import MainWindow
+
+        window = MainWindow(config=AppConfig(), db_manager=tmp_db)
+        now = datetime.now(timezone.utc)
+        events = [
+            SecurityEvent(
+                timestamp=now - timedelta(seconds=index),
+                source="process_collector",
+                category=EventCategory.PROCESS,
+                event_type="process_started",
+                description=f"Ordinary event {index}",
+                attributes={"name": "notepad.exe", "command_line": "notepad.exe"},
+            )
+            for index in range(525)
+        ]
+        suspicious = SecurityEvent(
+            timestamp=now - timedelta(seconds=600),
+            source="process_collector",
+            category=EventCategory.PROCESS,
+            event_type="process_started",
+            description="Suspicious process beyond first page",
+            attributes={
+                "name": "rundll32.exe",
+                "command_line": "rundll32.exe javascript:payload",
+            },
+        )
+        window.event_repo.add_events([*events, suspicious])
+
+        window.refresh_all_data(run_collectors=False)
+
+        assert len(window._cached_events) == window.events_view.PAGE_SIZE
+        assert window.events_view.page_label.text() == "Page 1 of 6"
+        assert suspicious.event_id not in {event.event_id for event in window._cached_events}
+        assert any(
+            str(suspicious.event_id) in alert.related_event_ids
+            for alert in window._cached_alerts
+        )
+        assert window.incident_manager.count_incidents() == 1
+
+        for _ in range(5):
+            window.events_view.next_page_btn.click()
+        assert window.events_view.page_index == 5
+        assert len(window._cached_events) == 26
+        assert suspicious.event_id in {event.event_id for event in window._cached_events}
+        assert window.events_view.page_label.text() == "Page 6 of 6"
+
+    def test_main_window_refresh_does_not_duplicate_incidents_for_same_alert(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.main_window import MainWindow
+
+        config = AppConfig()
+        window = MainWindow(config=config, db_manager=tmp_db)
+        event = SecurityEvent(
+            source="process_collector",
+            category=EventCategory.PROCESS,
+            event_type="process_started",
+            description="Suspicious process",
+            attributes={
+                "name": "rundll32.exe",
+                "pid": 4321,
+                "command_line": "rundll32.exe javascript:evil",
+            },
+        )
+        window.event_repo.add_event(event)
+
+        window.refresh_all_data(run_collectors=False)
+        first_incident_ids = {item.incident_id for item in window.incident_manager.incidents}
+        window.refresh_all_data(run_collectors=False)
+
+        assert len(window.incident_manager.incidents) == 1
+        assert {item.incident_id for item in window.incident_manager.incidents} == first_incident_ids
 
     def test_main_window_refresh_with_collectors(
         self, qapp: QApplication, tmp_db: DatabaseManager
@@ -560,7 +809,22 @@ class TestMainWindow:
 
         window.refresh_all_data(run_collectors=True)
         window.host_monitor.collect_once.assert_called_once()
-        window.win_collector.collect_events.assert_called_once()
+        window.win_collector.collect_events.assert_not_called()
+
+    def test_main_window_starts_and_stops_background_monitoring(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.main_window import MainWindow
+
+        window = MainWindow(config=AppConfig(), db_manager=tmp_db)
+        window.host_monitor.start = MagicMock()
+        window.host_monitor.stop = MagicMock()
+
+        window.start_monitoring()
+        window.close()
+
+        window.host_monitor.start.assert_called_once()
+        window.host_monitor.stop.assert_called_once()
 
     def test_main_window_navigate_to_event(
         self, qapp: QApplication, tmp_db: DatabaseManager
@@ -576,6 +840,27 @@ class TestMainWindow:
         # Should switch to Events view (index 1)
         assert window.stack.currentIndex() == 1
         assert window.events_view.search_input.text() == test_event_id
+
+    def test_main_window_opens_evidence_outside_default_timeframe(
+        self, qapp: QApplication, tmp_db: DatabaseManager
+    ) -> None:
+        from src.ui.main_window import MainWindow
+
+        window = MainWindow(config=AppConfig(), db_manager=tmp_db)
+        event = SecurityEvent(
+            timestamp=datetime.now(timezone.utc) - timedelta(days=3),
+            source="test",
+            category=EventCategory.SYSTEM,
+            event_type="old_evidence",
+            description="Older supporting event",
+        )
+        window.event_repo.add_event(event)
+
+        window._navigate_to_event(str(event.event_id))
+
+        assert window.overview_view.timeframe_combo.currentText() == "All Time"
+        assert window.events_view.table.rowCount() == 1
+        assert str(window.events_view._filtered_events[0].event_id) == str(event.event_id)
 
     def test_main_window_create_incident_from_alert(
         self, qapp: QApplication, tmp_db: DatabaseManager
