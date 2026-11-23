@@ -10,7 +10,7 @@ Mini SOC is designed to run locally on a Windows workstation or server. It focus
 - **Local-first Operation**: All data, events, and telemetry stay on the local system.
 - **Privacy & Security**: Zero telemetry phone-home, no credentials stored in configuration, and strict permission boundaries.
 - **Standardized Telemetry**: A unified, validated security event schema across heterogeneous data collectors (host event logs, process execution, network connections).
-- **Incident Lifecycle**: From raw event collection to rule-based detection, incident triage, and controlled response actions.
+- **Incident Lifecycle**: From raw event collection to rule-based detections, analyst triage, and persistent incident tracking. Mini SOC does not perform automated containment or remediation.
 - **Analyst Console**: A PySide6 desktop dashboard for reviewing events, triaging detections, managing incidents, and exporting reports.
 
 ---
@@ -42,7 +42,7 @@ The project follows a modular, decoupled architecture:
 - **`SecurityEvent`** (`src/core/events.py`): Pydantic v2 model with UUIDv4, UTC timestamps, severity enums, extensible attributes, bidirectional JSON & SQLite serialization.
 - **`DatabaseManager`** (`src/database/connection.py`): SQLite connection management with foreign keys, timeouts, parameterized queries, and transaction support.
 - **`EventRepository`** (`src/database/event_repository.py`): CRUD and filtered querying for security events.
-- **`DetectionEngine`** (`src/detection/rules.py`): Heuristic evaluation for selected process command patterns, fully attributed failed-logon spikes, and established connections using selected remote service ports.
+- **`DetectionEngine`** (`src/detection/rules.py`): Four heuristic rules covering selected suspicious process command patterns, possible keylogger indicators, attributed failed-logon spikes, and established connections to selected remote service ports.
 - **`IncidentManager`** (`src/incidents/manager.py`): Alert-to-incident conversion, status lifecycle, and analyst notes.
 
 ---
@@ -82,6 +82,7 @@ Collector -> SecurityEvent -> EventRepository -> SQLite
 - `main.py` is the primary entry point.
   - Running it without arguments executes one headless collection/detection cycle.
   - Running it with `--gui` starts the PySide6 desktop application.
+- In headless mode, detection evaluates up to the latest 500 persisted events. The GUI queries evidence independently for each rule and is not limited to the currently visible event page.
 - `src/ui/app.py::run_app()` initializes configuration and SQLite, creates `MainWindow`, and starts the Qt event loop.
 - `src/ui/main_window.py::MainWindow` owns the desktop application's backend wiring. It creates repositories, the host monitor, the Windows Event Log collector, the detection engine, and the incident manager.
 - In GUI mode, process, network, and Windows Event Log collectors run continuously at the configured 5-second host polling interval. The background collector stops when the window closes. Manual **Poll Sensors** requests an immediate additional cycle, and the Qt UI refreshes database-backed views every 30 seconds.
@@ -168,7 +169,7 @@ A channel checkpoint is the highest successfully processed Windows `EventRecordI
 
 `DatabaseManager` opens a short-lived SQLite connection for every repository operation. Connections enable foreign-key enforcement, use `sqlite3.Row`, have a 10-second busy timeout, commit successful operations, roll back exceptions, and close reliably.
 
-The database is located at `data/minisoc.db` by default. It is a file-backed local database; tests can use `:memory:` databases.
+The database is file-backed. By default, `AppConfig` places it at `<data_dir>\minisoc.db` (on Windows, `%LOCALAPPDATA%\Mini SOC\minisoc.db`). `MINISOC_DATA_DIR` or explicit `AppConfig` paths can change the location. Tests can use an in-memory SQLite database.
 
 #### Schema and Migrations
 
@@ -205,13 +206,19 @@ The collector also maintains an in-session record-key set and checks the persist
 
 ### Detection Engine
 
-`DetectionEngine` combines a sequence of independent `DetectionRule` implementations and flattens their `DetectionAlert` results. The default engine contains three rules:
+`DetectionEngine` combines independent `DetectionRule` implementations and flattens their `DetectionAlert` results. The default engine contains four heuristic rules:
 
 #### Suspicious Process Rule
 
 **Scope:** examines `process_started` events and flags selected command-line patterns for `cmd.exe`, PowerShell, and administrative/dual-use tools including `rundll32.exe`, `regsvr32.exe`, `wmic.exe`, `mshta.exe`, `certutil.exe`, `bitsadmin.exe`, `netsh.exe`, `bcdedit.exe`, and `psexec.exe`.
 
 For administrative binaries other than `cmd.exe` and PowerShell, an alert requires a configured command-line indicator rather than the process name alone. The alert severity is `HIGH`, and the event UUID is attached through `related_event_ids`. **Limitations and false positives:** these are dual-use tools; legitimate administration, software installation, and support activity can match. A match is a triage lead, not evidence of malicious intent. Validate user, parent process, full command line, and host context. Positive and benign command-line cases are covered by `tests/test_detection.py`.
+
+#### Possible Keylogger Rule
+
+**Scope:** examines `process_started` events and raises a `MEDIUM` alert when the observed process name, executable path, or command line contains an explicit keylogger/keystroke-logger marker or a configured keyboard-capture API/library indicator. Current indicators include `SetWindowsHookEx`, `GetAsyncKeyState`, `pynput.keyboard`, `keyboard.hook`, and `keyboard.listener`. Indicator matching is case-insensitive.
+
+**Limitations and false positives:** this rule evaluates process metadata only. It does not inspect memory, observe keyboard-hook activity at runtime, or collect keystrokes, and an indicator match does not prove that a process captures input. Accessibility, input, and automation software may contain the same APIs or libraries. Validate the executable, signature, path, parent process, user, and host context. Positive and unrelated-process cases are covered by `tests/test_detection.py`.
 
 #### Failed Logon Spike Rule
 
@@ -259,15 +266,15 @@ The manager does not own an automated containment or remediation system. Inciden
 
 Parent directories are created automatically for export destinations.
 
-Exports are plaintext copies of security data. They are written to the path selected in the export dialog, are not encrypted by Mini SOC, and are not covered by the 90-day database event cleanup. Store them outside synchronized/shared folders, restrict access with OS ACLs, and apply your own retention and secure-deletion policy.
+JSON exports redact values under recognized sensitive field names. CSV exports contain selected fields and neutralize spreadsheet formula prefixes; neither format can identify arbitrary secrets embedded in free text. Exports are plaintext copies of security data. They are written to the path selected in the export dialog, are not encrypted by Mini SOC, and are not covered by the 90-day database event cleanup. Store them outside synchronized/shared folders, restrict access with OS ACLs, and apply your own retention and secure-deletion policy.
 
 Create a consistent backup of the configured database while Mini SOC is running, using the SQLite online backup API:
 
 ```powershell
-python -m src.database.backup "$env:USERPROFILE\Documents\MiniSOC-backup-2026-11-22.db"
+.venv\Scripts\python.exe -m src.database.backup "$env:USERPROFILE\Documents\MiniSOC-backup-new.db"
 ```
 
-The destination must not already exist. Keep backups in a protected, non-synchronized location, verify that the command completed, and periodically test opening a copy. Database backups include the records present at backup time; event retention deletes events older than 90 days when the application starts, not when a backup is created. Incidents and export files are not automatically expired.
+The destination must not already exist; choose a different filename if this example file is already present. Keep backups in a protected, non-synchronized location, verify that the command completed, and periodically test opening a copy. Database backups include the records present at backup time; event retention deletes events older than 90 days when the application starts, not when a backup is created. Incidents and export files are not automatically expired.
 
 ### Security and Logging
 
@@ -280,10 +287,11 @@ The backend has multiple defensive measures:
 - timestamps are normalized and event fields are validated;
 - local log entries are sanitized with `redact_sensitive_data()`;
 - sensitive key names containing password, secret, token, API key, authorization, cookie, session, JWT, private key, or access key are replaced with `[REDACTED]`;
+- structured JSON and UI detail data use this key-based redaction; free-text fields may still contain secrets, and CSV formula neutralization is not general secret detection;
 - collector exceptions are isolated so a process, network, or Windows channel failure does not crash the application.
 - process command lines can contain secrets; the collector masks common credential switches, but that is best-effort and cannot identify arbitrary sensitive text.
 
-Operational logs are written to `data/logs/minisoc.log`. The backend uses an INFO-level project logger by default, with file-only logging in the normal application process.
+Operational logs are written to `<data_dir>\logs\minisoc.log` (on Windows, `%LOCALAPPDATA%\Mini SOC\logs\minisoc.log` by default). The backend uses an INFO-level project logger by default, with file-only logging in the normal application process.
 
 ### GUI-to-Backend Synchronization
 
@@ -329,15 +337,18 @@ SQLite schema changes should create a new migration version in `schema.py` and a
 
 ---
 
-## 3. Project Directory Structure
+## 3. Repository Layout (Key Files)
 
 ```
 mini-soc/
+├── .gitignore
 ├── main.py                         # Entry point: headless (default) or --gui
-├── requirements.txt                # Production and testing dependencies
+├── requirements.txt                # Runtime and test dependencies
 ├── README.md
-├── data/                           # Local storage (SQLite database, logs)
-│   └── .gitkeep
+├── PROJECT_STATUS_REPORT.md        # Implementation status, limitations, and validation notes
+├── screenshots/                    # UI screenshots used in this README
+├── data/
+│   └── .gitkeep                    # Legacy database migration location, not default runtime storage
 ├── src/
 │   ├── __init__.py
 │   ├── core/
@@ -353,6 +364,7 @@ mini-soc/
 │   │   └── monitor_service.py       # Orchestrator: HostMonitorService
 │   ├── database/
 │   │   ├── connection.py            # DatabaseManager
+│   │   ├── backup.py                # Consistent SQLite backup CLI
 │   │   ├── schema.py               # Versioned schema migrations
 │   │   ├── event_repository.py     # Event persistence
 │   │   ├── alert_state_repository.py # Persisted detection review state
@@ -379,6 +391,8 @@ mini-soc/
 │           ├── incidents_view.py   # Incident management panel
 │           └── settings_view.py    # Diagnostics and configuration view
 └── tests/
+    ├── __init__.py
+    ├── test_main.py
     ├── test_config.py
     ├── test_events.py
     ├── test_database.py
@@ -390,6 +404,8 @@ mini-soc/
     ├── test_security.py
     └── test_ui.py                  # PySide6 UI tests (offscreen)
 ```
+
+Runtime data is stored outside the checkout by default. A historical `data/minisoc.db` is recognized only as a migration source when the configured database does not yet exist; new databases and logs are not written there by default. Package `__init__.py` files are omitted from this key-file view.
 
 ---
 
@@ -534,4 +550,4 @@ The suite covers configuration, events, database, collectors, detection, reporti
 | Incident Workflow | ✅ Complete | Stable alert deduplication, status lifecycle, analyst notes, evidence timeline, SQLite persistence |
 | Reporting & Export | ✅ Complete | CSV and JSON export for events, incidents, and summaries |
 | Desktop Console (PySide6) | ✅ Complete | 5-view dashboard with dark theme, severity badges, filters, triage actions, CSV export |
-| Automated Test Suite | ✅ Complete | Tests cover all subsystems including UI tests |
+| Automated Test Suite | ⚠️ Validation needed | Tests cover the major subsystems, but the latest full run exited abnormally after reporting its passing tests; see `PROJECT_STATUS_REPORT.md` |
